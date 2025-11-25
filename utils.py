@@ -173,3 +173,82 @@ def create_V_matrix(predicates):
         for v in vars_list:
             V[i, var_idx[v]] = 1.0
     return V, variables
+
+
+def compute_acc_ratio(model, x, y, rule_idx):
+    with torch.no_grad():
+        rule = model.rules[rule_idx]
+        body_conj = sum(rule[i](x[:, [i]]) for i in range(model.num_neurons_per_rule))
+        rule_weights = []
+        for neuron in rule:
+            weights = torch.softmax(neuron.raw_weights, dim=0).detach().numpy().tolist()
+            rule_weights.append(weights)
+
+        num_body_preds = x.shape[1] - sum([1 for w in rule_weights if np.round(w[2]) == 1.0])
+        threshold = 0.5**(num_body_preds)
+        body = (torch.exp(body_conj) >= threshold).float()
+
+        # Match the shape of body with y
+        if body.shape != y.shape:
+            body = body.squeeze(-1)
+
+        # find cosine similarity between body and y
+        cos_sim = nn.CosineSimilarity(dim=0)(body, y)
+
+        return cos_sim.item()
+
+def compute_acc_ratio_all_rules(model, x, y):
+    with torch.no_grad():
+        for rule_idx, rule in enumerate(model.rules):
+            pred_values = [rule[i](x[:, [i]]) for i in range(model.num_neurons_per_rule)]
+            rule_weights = []
+            for neuron in rule:
+                weights = torch.softmax(neuron.raw_weights, dim=0).detach().numpy().tolist()
+                rule_weights.append(weights)
+
+            # This should be double checked because it may not be accurate
+            num_body_preds = x.shape[1] - sum([1 for w in rule_weights if np.argmax(w) == 2 and np.round(w[2]) == 1.0]) # x.shape[1] is the number of potential body predicates
+            threshold = 0.5**(num_body_preds)
+            body = (torch.exp(body_conj) >= threshold).float()
+
+            if rule_idx == 0:
+                fuzzy_or = body
+            else:
+                fuzzy_or = fuzzy_or + body - fuzzy_or * body
+
+        # Match the shape of body with y
+        if fuzzy_or.shape != y.shape:
+            fuzzy_or = fuzzy_or.squeeze(-1)
+
+        # find cosine similarity between body and y
+        cos_sim = nn.CosineSimilarity(dim=0)(fuzzy_or, y)
+
+        return cos_sim.item()
+
+def compute_acc_ratio_all_rules_attention(model, x, y, beta=10.0):
+    with torch.no_grad():
+        rule_outputs = []
+        for rule in model.rules:
+            conjunctions = []
+            for i, neuron in enumerate(rule):
+                xi = x[:, [i % model.input_dim]]
+                conjunctions.append(neuron(xi).squeeze())
+            # Softmin attention over neurons (optional, or just use sum)
+            conjunctions = torch.stack(conjunctions, dim=1)  # (batch, num_neurons)
+            attention_weights = torch.softmax(-beta * conjunctions, dim=1)
+            outputs = (attention_weights * conjunctions).sum(dim=1)  # (batch,)
+            activated_outputs = torch.sigmoid(5 * (outputs - 0.5))
+            rule_outputs.append(activated_outputs)
+
+        # Stack rule outputs: shape (num_rules, batch)
+        rule_outputs_tensor = torch.stack(rule_outputs, dim=0)  # (num_rules, batch)
+        # Softmax attention over rules for each sample (dim=0)
+        attention_weights = torch.softmax(beta * rule_outputs_tensor, dim=0)
+        # Weighted sum over rules for each sample
+        final_output = (attention_weights * rule_outputs_tensor).sum(dim=0)  # (batch,)
+        # Compute accuracy
+        preds = (final_output > 0.5).float()
+        acc = (preds == (y > 0.5)).float().mean().item()
+        return acc
+
+# compute_acc_ratio(best_model, X_train, y_train, 0)
