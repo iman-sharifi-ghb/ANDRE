@@ -4,6 +4,8 @@ import torch.optim as optim
 from copy import deepcopy
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+import os
+import json
 GAMMA1 = 0.5
 GAMMA2 = 0.5
 
@@ -173,3 +175,95 @@ class ANDRE(nn.Module):
         print("=" * 60)
         
         return metrics
+    
+    def save_model(self, save_dir, model_name="andre_model"):
+        """
+        Save ANDRE model weights and configuration to a directory.
+        
+        Args:
+            save_dir: Directory path to save the model
+            model_name: Name prefix for saved files (default: "andre_model")
+        
+        Saves:
+            - {model_name}_weights.pt: Model state dict (weights)
+            - {model_name}_config.json: Model configuration
+        """
+        # Create directory if it doesn't exist
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Save model weights
+        weights_path = os.path.join(save_dir, f"{model_name}_weights.pt")
+        torch.save(self.state_dict(), weights_path)
+        
+        # Save model configuration
+        config = {
+            'num_rules': self.num_rules,
+            'input_dim': self.input_dim,
+            'beta': self.beta,
+            'lambda_': self.lambda_,
+            'has_variable_matrix': self.V is not None,
+            'variable_matrix': self.V.tolist() if self.V is not None else None
+        }
+        
+        config_path = os.path.join(save_dir, f"{model_name}_config.json")
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        print(f"Model saved successfully to {save_dir}")
+        print(f"  - Weights: {weights_path}")
+        print(f"  - Config:  {config_path}")
+        
+        return weights_path, config_path
+    
+    @classmethod
+    def load_model(cls, save_dir, model_name="andre_model", lr=0.005, weight_decay=1e-5):
+        """
+        Load ANDRE model from saved weights and configuration.
+        
+        Args:
+            save_dir: Directory path where model was saved
+            model_name: Name prefix of saved files (default: "andre_model")
+            lr: Learning rate for optimizer (default: 0.005)
+            weight_decay: Weight decay for optimizer (default: 1e-5)
+        
+        Returns:
+            Loaded ANDRE model
+        """
+        # Load configuration
+        config_path = os.path.join(save_dir, f"{model_name}_config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Reconstruct variable matrix if it exists
+        variable_matrix = None
+        if config['has_variable_matrix'] and config['variable_matrix'] is not None:
+            variable_matrix = torch.tensor(config['variable_matrix'], dtype=torch.float32)
+        
+        # Create model instance
+        model = cls(
+            num_rules=config['num_rules'],
+            pot_body_pred_dim=config['input_dim'],
+            variable_matrix=variable_matrix,
+            beta=config['beta'],
+            lambda_=config['lambda_'],
+            lr=lr,
+            weight_decay=weight_decay
+        )
+        
+        # Load weights
+        weights_path = os.path.join(save_dir, f"{model_name}_weights.pt")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Weights file not found: {weights_path}")
+        
+        model.load_state_dict(torch.load(weights_path))
+        model.eval()
+        
+        print(f"Model loaded successfully from {save_dir}")
+        print(f"  - Weights: {weights_path}")
+        print(f"  - Config:  {config_path}")
+        print(f"  - Num Rules: {config['num_rules']}, Input Dim: {config['input_dim']}")
+        
+        return model
