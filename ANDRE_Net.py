@@ -9,11 +9,17 @@ import json
 GAMMA1 = 0.5
 GAMMA2 = 0.5
 
+def special_randon_tensor():
+    t = torch.randn(3)
+    t[2] = t[:2].max() + 2 * torch.rand(1).item() + 3
+    return t
+
 # Define CustomNeuron and FuzzyDisjunctionNet
 class ProbSumActivation(nn.Module):
     def __init__(self):
         super(ProbSumActivation, self).__init__()
-        self.raw_weights = nn.Parameter(torch.randn(3) * 0.1)  # Small init to prevent saturation
+        # self.raw_weights = nn.Parameter(torch.randn(3) * 0.1)  # Small init to prevent saturation
+        self.raw_weights = nn.Parameter(special_randon_tensor())  # Small init to prevent saturation
 
     def forward(self, x):
         self.weights = torch.softmax(self.raw_weights, dim=0)
@@ -37,7 +43,7 @@ class ANDRE(nn.Module):
         self.input_dim = pot_body_pred_dim
         self.V = variable_matrix
         self.M_matrices = []
-        self.rules = nn.ModuleList([
+        self.rule = nn.ModuleList([
             nn.ModuleList([ProbSumActivation() for _ in range(pot_body_pred_dim)])
             for _ in range(num_rules)
         ])
@@ -51,21 +57,21 @@ class ANDRE(nn.Module):
         self.M_matrices = []
         rule_outputs = []
 
-        for i, rule in enumerate(self.rules):
+        for i, subrule in enumerate(self.rule):
             conjunctions = []
-            rule_weights = []
+            subrule_weights = []
             entropy_sum = 0.0
             P = []
-            for j, neuron in enumerate(rule):
+            for j, probsumact in enumerate(subrule):
                 xi = x[:, [j % self.input_dim]]
-                conjunctions.append(neuron(xi))
-                weights = neuron.weights
-                rule_weights.append(weights)
+                conjunctions.append(probsumact(xi))
+                weights = probsumact.weights
+                subrule_weights.append(weights)
                 entropy_sum += -(weights * torch.log(weights + 1e-6)).sum()
                 P.append(1.0 - weights[2])  # 1 - w3
 
-            rule_vector = torch.cat(rule_weights)
-            self.saved_weights.append(rule_vector)
+            subrule_vector = torch.cat(subrule_weights)
+            self.saved_weights.append(subrule_vector)
             self.entropies.append(entropy_sum)
 
             P_tensor = torch.stack(P)
