@@ -18,6 +18,7 @@ class ProbSumActivation(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
         self.raw_weights = nn.Parameter(torch.randn(input_dim, 3) * 0.1)
+        # self.raw_weights = nn.Parameter(special_randon_tensor(input_dim))
 
     def forward(self, X_basis):
         """
@@ -147,7 +148,7 @@ class ANDRE(nn.Module):
             dict: Dictionary containing all evaluation metrics
         """
         with torch.no_grad():
-            outputs = self.forward(x).squeeze()
+            outputs, _, _, _ = self.forward(x)
             
             # Move to CPU and convert to numpy for sklearn metrics
             y_true = y.cpu().numpy()
