@@ -52,10 +52,11 @@ class RuleBlock(nn.Module):
         super().__init__()
         self.activation = ProbSumActivation(input_dim)
 
-    def forward(self, X_basis, beta, lambda_, GAMMA1):
+    def forward(self, X_basis, beta, lambda_, GAMMA1, V=None):
         """
         X_basis: [B, D, 3]
-        returns: rule_output [B], weights [D,3], entropy, P [D]
+        V: variable matrix [D, K] or None
+        returns: rule_output [B], weights [D,3], entropy, P [D], M [K] or None
         """
         # Apply ProbSum over all predicates at once
         conj, weights = self.activation(X_basis)      # conj: [B, D]
@@ -66,12 +67,18 @@ class RuleBlock(nn.Module):
         # P_j = 1 - w3
         P = 1.0 - weights[:, 2]                       # [D]
 
+        # Compute M with proper gradient tracking
+        if V is not None:
+            M = torch.matmul(P, V)                    # [D] @ [D,K] = [K]
+        else:
+            M = None
+
         # Soft minimum over conjunctions (attention softmin)
         attn = torch.softmax(-beta * conj, dim=1)     # [B, D]
         out = (attn * conj).sum(dim=1)                # [B]
         rule_output = torch.sigmoid(lambda_ * (out - GAMMA1))
 
-        return rule_output, weights, entropy, P
+        return rule_output, weights, entropy, P, M
 
 
 class ANDRE(nn.Module):
@@ -84,7 +91,13 @@ class ANDRE(nn.Module):
         self.input_dim = pot_body_pred_dim
         self.beta = beta
         self.lambda_ = lambda_
-        self.V = variable_matrix
+
+        # Register variable matrix as buffer (doesn't require grad but moves with model)
+        if variable_matrix is not None:
+            self.register_buffer('V', variable_matrix if isinstance(variable_matrix, torch.Tensor) 
+                               else torch.tensor(variable_matrix, dtype=torch.float32))
+        else:
+            self.V = None
 
         # Create rule blocks
         self.rules = nn.ModuleList([RuleBlock(self.input_dim) for _ in range(num_rules)])
@@ -113,15 +126,10 @@ class ANDRE(nn.Module):
 
         # Evaluate each rule as a batch
         for r in self.rules:
-            r_out, weights, entropy, P = r(X_basis, self.beta, self.lambda_, GAMMA1)
+            r_out, weights, entropy, P, M = r(X_basis, self.beta, self.lambda_, GAMMA1, self.V)
             rule_vals.append(r_out)                      # r_out: [B]
             all_weights.append(weights.view(-1))         # flatten weights
             all_entropies.append(entropy)
-
-            if self.V is not None:
-                M = P @ self.V                           # [D] @ [D,K] = [K]
-            else:
-                M = None
             all_M.append(M)
 
         # Stack rules
