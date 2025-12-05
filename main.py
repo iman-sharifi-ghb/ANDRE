@@ -25,6 +25,18 @@ import numpy as np
 from datetime import datetime
 
 
+def str2bool(v):
+    """Convert string to boolean for argparse."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -33,9 +45,9 @@ def parse_args():
     )
     
     # Data options
-    parser.add_argument('--synthetic_data', type=bool, default=True,
+    parser.add_argument('--synthetic_data', type=str2bool, default=True,
                         help='Use synthetic data (True) or load from file (False)')
-    parser.add_argument('--structured_data', type=bool, default=True,
+    parser.add_argument('--structured_data', type=str2bool, default=True,
                         help='Use structured data with predicates')
     parser.add_argument('--dataset_type', type=str, default='binary', choices=['binary', 'continuous'],
                         help='Type of dataset')
@@ -63,7 +75,7 @@ def parse_args():
                         help='Validation split ratio')
     
     # Loss weights
-    parser.add_argument('--sim_weight', type=float, default=0.03,
+    parser.add_argument('--sim_weight', type=float, default=0.2,
                         help='Weight for similarity penalty')
     parser.add_argument('--ent_weight', type=float, default=0.1,
                         help='Weight for entropy loss')
@@ -83,11 +95,11 @@ def parse_args():
                         help='Accuracy threshold for early stopping')
     
     # Output options
-    parser.add_argument('--visualize_weights', type=bool, default=False,
+    parser.add_argument('--visualize_weights', type=str2bool, default=False,
                         help='Visualize learned weights')
-    parser.add_argument('--verbose', type=bool, default=True,
+    parser.add_argument('--verbose', type=str2bool, default=True,
                         help='Print verbose output')
-    parser.add_argument('--save_model', type=bool, default=True,
+    parser.add_argument('--save_model', type=str2bool, default=True,
                         help='Save the best model')
     parser.add_argument('--save_dir', type=str, default='saved_models',
                         help='Directory to save models')
@@ -99,26 +111,34 @@ def parse_args():
                         help='Force CPU usage even if CUDA is available')
     
     # Evaluation options
-    parser.add_argument('--evaluate_individual_rules', type=bool, default=True,
+    parser.add_argument('--evaluate_individual_rules', type=str2bool, default=False,
                         help='Evaluate and sort individual rules by accuracy')
     
     return parser.parse_args()
 
 
-def schedule_rr_conn_digit_weight(epoch, total_epochs, initial_rr_weight, max_rr_weight, 
-                                   initial_conn_weight, max_conn_weight, 
-                                   initial_digit_weight, max_digit_weight):
+def schedule_loss_weights(epoch, total_epochs, 
+                        initial_ent_weight=0.0, final_ent_weight=0.1, 
+                        initial_rr_weight=0.0, final_rr_weight=1.0, 
+                        initial_conn_weight=0.0, final_conn_weight=3.0, 
+                        initial_digit_weight=0.0, final_digit_weight=0.05, 
+                        initial_sim_weight=1.0, final_sim_weight=0.1):
+    
     """Schedule weights for range restriction, connectivity, and digitization losses."""
     # Linearly increase rr_weight and conn_weight from 0 to their initial values over the epochs
-    rr_weight = initial_rr_weight + (epoch / total_epochs)**2 * max_rr_weight
-    conn_weight = initial_conn_weight + (epoch / total_epochs)**2 * max_conn_weight
-    digit_weight = initial_digit_weight + (epoch / total_epochs)**2 * max_digit_weight
+    ent_weight = initial_ent_weight + (epoch / total_epochs) * (final_ent_weight - initial_ent_weight)
+    rr_weight = initial_rr_weight + (epoch / total_epochs)**2 * (final_rr_weight - initial_rr_weight)
+    conn_weight = initial_conn_weight + (epoch / total_epochs)**2 * (final_conn_weight - initial_conn_weight)
+    digit_weight = initial_digit_weight + (epoch / total_epochs)**2 * (final_digit_weight - initial_digit_weight)
+    sim_weight = initial_sim_weight + (epoch / total_epochs)**2 * (final_sim_weight - initial_sim_weight)
 
-    rr_weight = min(rr_weight, max_rr_weight)
-    conn_weight = min(conn_weight, max_conn_weight)
-    digit_weight = min(digit_weight, max_digit_weight)
+    ent_weight = min(ent_weight, final_ent_weight)
+    rr_weight = min(rr_weight, final_rr_weight)
+    conn_weight = min(conn_weight, final_conn_weight)
+    digit_weight = min(digit_weight, final_digit_weight)
+    sim_weight = min(sim_weight, final_sim_weight)
     
-    return rr_weight, conn_weight, digit_weight
+    return ent_weight, rr_weight, conn_weight, digit_weight, sim_weight
 
 
 def get_predicate_name(index, predicate_list, relation_variable_permutations, all_relations):
@@ -129,7 +149,7 @@ def get_predicate_name(index, predicate_list, relation_variable_permutations, al
     var_tuple = predicate_list[index]
     
     # Variable name mapping
-    var_names = {0: 'X1', 1: 'X2', 2: 'X3', 3: 'X4'}
+    var_names = {0: 'X1', 1: 'X2', 2: 'X3', 3: 'X4', 4: 'X5', 5: 'X6'}
     
     # Find which relation this belongs to
     cumulative_index = 0
@@ -175,7 +195,7 @@ def evaluate_single_rule(rule_weights, X_data, y_data, variable_matrix, device):
     # The raw_weights are in the activation layer
     with torch.no_grad():
         # Stack all neuron weights into a single tensor [input_dim, 3]
-        weights_array = torch.tensor(rule_weights, dtype=torch.float32)  # [input_dim, 3]
+        weights_array = torch.tensor(rule_weights, dtype=torch.float32, device=device)  # [input_dim, 3]
         # Use log to approximate inverse softmax
         single_rule_model.rules[0].activation.raw_weights.data = torch.log(weights_array + 1e-10)
     
@@ -324,7 +344,22 @@ def main():
                                                 relation_variable_permutations, 
                                                 all_relations)
             body_predicates.append(predicate_name)
-        head_predicate = body_predicates[252]  # Example head predicate
+        head_predicate = "blockpositionindex(X1, X2)" #body_predicates[252]  # Example head predicate
+        for idx in range(len(predicate_list)):
+            if body_predicates[idx] == head_predicate:
+                headpred_idx = idx
+                print(f"Found head predicate at index {idx} in body predicates.")
+                break
+
+        # remove the head predicate from body predicates
+        body_predicates.remove(head_predicate)
+        print("Number of body predicates:", len(body_predicates))
+
+        # remove the corresponding column from X_train
+        X_train = torch.cat((X_train[:, :headpred_idx], X_train[:, headpred_idx+1:]), dim=1)
+
+        # check if the length of body_predicates matches the number of columns in X_train
+        assert len(body_predicates) == X_train.shape[1], "Mismatch between body predicates and X_train columns."
         variable_matrix, variables = create_V_matrix(body_predicates)
         head_vars = [0, 1]
         connected_vars = [2, 3]
@@ -397,6 +432,9 @@ def main():
     best_train_metric = -float('inf')
     best_overall_metric = -float('inf')
     best_losses = []
+    
+    # Store all discovered rules with their accuracies
+    all_discovered_rules = []
 
     for num_rules in range(Num_rules):
         for restart in range(num_restarts):
@@ -410,6 +448,17 @@ def main():
 
             for epoch in range(num_epochs):
                 model.train()
+
+                # Schedule loss weights
+                ent_weight_, rr_weight_, conn_weight_, digit_weight_, sim_weight_ = schedule_loss_weights(
+                            epoch=epoch, total_epochs=num_epochs,
+                            final_ent_weight=ent_weight, 
+                            final_rr_weight=rr_weight, 
+                            final_conn_weight=conn_weight,
+                            final_digit_weight=digit_weight,
+                            initial_sim_weight=2.0,
+                            final_sim_weight=sim_weight
+                            )
 
                 # Shuffle dataset
                 perm = torch.randperm(num_samples, device=device)
@@ -482,19 +531,19 @@ def main():
                         entropy_term = torch.stack(weight_entropies).sum()
                         entropy_term = entropy_term / (num_rules + 1) /  input_dim
 
-                        rr_weight_, conn_weight_, digit_weight_ = schedule_rr_conn_digit_weight(
-                            epoch=epoch, total_epochs=num_epochs, 
-                            initial_rr_weight=0, max_rr_weight=rr_weight, 
-                            initial_conn_weight=0, max_conn_weight=conn_weight,
-                            initial_digit_weight=0, max_digit_weight=digit_weight)
-
                         # Total Loss
-                        total_loss = bce_loss + ent_weight * entropy_term + rr_weight_ * rr_loss + conn_weight_ * conn_loss + digit_weight_ * digit_loss
+                        total_loss = bce_loss + ent_weight_ * entropy_term + \
+                                    rr_weight_ * rr_loss + conn_weight_ * conn_loss + \
+                                    digit_weight_ * digit_loss + sim_weight_ * sim_loss
+
+                        # print(f"Epoch {epoch+1}, Batch {i//batch_size+1}: BCE={bce_loss.item():.4f}, \
+                        #       RR={rr_weight_ * rr_loss.item():.4f}, Conn={conn_weight_ * conn_loss.item():.4f}, Digit={digit_weight_ * digit_loss.item():.4f}, \
+                        #       Ent={ent_weight_ * entropy_term.item():.4f}, Sim={sim_weight_ * float(sim_loss):.4f}")
 
                     else: 
                         entropy_term = torch.stack(weight_entropies).sum()
                         entropy_term = entropy_term / (num_rules + 1) /  input_dim
-                        total_loss = bce_loss + ent_weight * entropy_term
+                        total_loss = bce_loss + ent_weight_ * entropy_term + sim_weight_ * sim_loss
 
                     total_loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -505,17 +554,19 @@ def main():
                 model.scheduler.step()
                 losses_andre.append(epoch_loss)
 
-            if verbose:
-                Weights_andre = []
-                for rule_weights in model_weights:
-                    rule_weights = rule_weights.detach().cpu().numpy()
-                    body_predicate_weights = rule_weights.reshape(-1, 3)
-                    Weights_andre.append(body_predicate_weights.tolist())
+            # Extract rules from this trained model
+            Weights_andre = []
+            for rule_weights in model_weights:
+                rule_weights = rule_weights.detach().cpu().numpy()
+                body_predicate_weights = rule_weights.reshape(-1, 3)
+                Weights_andre.append(body_predicate_weights.tolist())
 
-                # Rule interpretation
-                final_rule = extract_rules(Weights_andre=Weights_andre, X_train=X_train, 
-                                        dataset_type=dataset_type, body_predicates=body_predicates,
-                                        head_predicate=head_predicate)
+            # Rule interpretation
+            final_rule = extract_rules(Weights_andre=Weights_andre, X_train=X_train, 
+                                    dataset_type=dataset_type, body_predicates=body_predicates,
+                                    head_predicate=head_predicate)
+            
+            if verbose:
                 print("\n======================================")
                 print("Final Rule:")
                 print(final_rule)
@@ -528,7 +579,58 @@ def main():
             train_metric = 0.5 * (training_metrics['accuracy'] + training_metrics['recall'])
             overall_metric = 0.5 * (train_metric + eval_metric)
 
+            # Store each individual subrule with its metrics
+            for rule_idx, rule_weights in enumerate(Weights_andre):
+                # Extract individual rule text
+                if dataset_type == "binary":
+                    preds = interpret_neuron_weights(body_preds=body_predicates, Weights=rule_weights)
+                else:
+                    sample_pred_values = X_train[0].cpu().numpy()
+                    preds = interpret_neuron_weights_entropy(sample_pred_values, rule_weights)
+                
+                refined_preds = [pred for pred in preds if pred != '1' and pred != '?']
+                subrule_text = " and ".join(refined_preds) if refined_preds else "true"
+                full_subrule = f"{head_predicate} :- {subrule_text}."
+                
+                # Evaluate this individual subrule
+                subrule_metrics = evaluate_single_rule(
+                    rule_weights,
+                    X_train,
+                    y_train,
+                    variable_matrix if structured_data else None,
+                    device
+                )
+                subrule_eval_metrics = evaluate_single_rule(
+                    rule_weights,
+                    X_val,
+                    y_val,
+                    variable_matrix if structured_data else None,
+                    device
+                )
+                
+                # Check if this rule already exists (avoid duplicates)
+                rule_exists = any(r['rule'] == full_subrule for r in all_discovered_rules)
+                
+                if not rule_exists:
+                    all_discovered_rules.append({
+                        'rule': full_subrule,
+                        'training_accuracy': subrule_metrics['accuracy'],
+                        'eval_accuracy': subrule_eval_metrics['accuracy'],
+                        'num_rules': num_rules + 1,
+                        'restart': restart + 1,
+                        'subrule_idx': rule_idx + 1,
+                        'training_precision': subrule_metrics['precision'],
+                        'training_recall': subrule_metrics['recall'],
+                        'training_f1': subrule_metrics['f1_score'],
+                        'eval_precision': subrule_eval_metrics['precision'],
+                        'eval_recall': subrule_eval_metrics['recall'],
+                        'eval_f1': subrule_eval_metrics['f1_score']
+                    })
+
             print(f"Num Rules: {num_rules + 1}, Restart {restart+1}/{num_restarts}, Train Metric: {train_metric:.4f}, Evaluation Metric: {eval_metric:.4f}.")
+            
+            # Print current discovered subrules count
+            print(f"Total unique subrules discovered so far: {len(all_discovered_rules)}")
             
             if min(losses_andre) < best_loss:
                 print(f"**** New Best Model ****")
@@ -668,6 +770,34 @@ def main():
         print(final_sorted_rule)
         print("="*70)
 
+    # Print summary of all discovered rules
+    print("\n" + "="*80)
+    print("ALL DISCOVERED SUBRULES (DEDUPLICATED)")
+    print("="*80)
+    
+    # Sort by eval_accuracy
+    sorted_all_rules = sorted(all_discovered_rules, key=lambda x: x['eval_accuracy'], reverse=True)
+    
+    print(f"\nTotal unique subrules discovered: {len(sorted_all_rules)}")
+    
+    for idx, rule_info in enumerate(sorted_all_rules, 1):
+        print(f"\n[{idx}] {rule_info['rule']}")
+        print(f"    Training Accuracy: {rule_info['training_accuracy']:.4f} | Eval Accuracy: {rule_info['eval_accuracy']:.4f}")
+        print(f"    Training F1: {rule_info['training_f1']:.4f} | Eval F1: {rule_info['eval_f1']:.4f}")
+        print(f"    (Found in: Num_rules={rule_info['num_rules']}, Restart={rule_info['restart']}, Subrule #{rule_info['subrule_idx']})")
+    
+    print("\n" + "="*80)
+    
+    # Return the list for programmatic access
+    return all_discovered_rules
+
 
 if __name__ == '__main__':
-    main()
+    all_rules = main()
+    
+    # Optional: Save to file
+    if all_rules:
+        import json
+        with open('discovered_rules.json', 'w') as f:
+            json.dump(all_rules, f, indent=2)
+        print(f"\nSaved {len(all_rules)} discovered rules to 'discovered_rules.json'")
