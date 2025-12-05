@@ -17,4 +17,5 @@ archiv/
 alphailp/
 
 saved_models/
-\ndiscovered_rules.json
+
+*.json
