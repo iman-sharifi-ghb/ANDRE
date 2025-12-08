@@ -55,7 +55,6 @@ ipykernel==6.29.5
 ipython==9.0.1
 ipython_pygments_lexers==1.1.1
 itsdangerous==2.2.0
-janus_swi==1.5.2
 jedi==0.19.2
 Jinja2==3.1.5
 joblib==1.4.2
@@ -105,7 +104,6 @@ pillow==11.1.0
 platformdirs==4.3.6
 pluggy==1.6.0
 portalocker==3.2.0
-problog==2.2.8
 prompt_toolkit==3.0.50
 protobuf==5.29.3
 psutil==7.0.0

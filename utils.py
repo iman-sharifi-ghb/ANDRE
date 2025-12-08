@@ -474,6 +474,6 @@ def extract_rules(Weights_andre, X_train, dataset_type, body_predicates, head_pr
     Final_rules = [rule.replace(".", "") for rule in Final_rules]
 
     # convert the rules to a single rule
-    final_rule = "h :- " + " OR ".join(Final_rules) + "."
+    final_rule = f"{head_predicate} :- " + " OR ".join(Final_rules) + "."
 
     return final_rule

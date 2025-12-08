@@ -424,26 +424,30 @@ def make_small_data(all_substitution, relation, relation_variable_permutations, 
     return valid_substitution, times_substitution
 
 
-def main_processing(dataset_name, t_relation='', path_name='', original_data_path='', 
-                   variable_depth=1):
+def main_processing(dataset_file, t_relation='', path_name='', original_data_path='', 
+                   variable_depth=1, input_dataset_path=''):
     """
     Main processing pipeline for data generation.
     
     Args:
-        dataset_name: Name of the dataset file
+        dataset_file: Name of the dataset file
         t_relation: Target relation name
         path_name: Path to save intermediate files
-        original_data_path: Path to original data
+        original_data_path: Path to save original data
         variable_depth: Depth of variable relationships
+        input_dataset_path: Path to read input dataset from
         
     Returns:
         tuple: (ALL_objects list, target_arity, target_predicate) or (-1, -1, -1) if failed
     """
     variable_number = variable_depth + 2
     
+    # Construct full input path
+    input_file_path = os.path.join(input_dataset_path, dataset_file)
+    
     # Step 1: Classify relations and objects
     variable_objects, relation_name, relation, arity_relation, target_arity = classifier(
-        os.path.join(original_data_path, dataset_name), 
+        input_file_path, 
         variable_number, 
         original_data_path, 
         t_relation
@@ -588,15 +592,15 @@ def main_processing(dataset_name, t_relation='', path_name='', original_data_pat
     return ALL_objects, target_arity, target_predicate
 
 
-def data_assemble(dataset_name, predicate, variable_depth, data_dir):
+def data_assemble(dataset_name, dataset_file, predicate, variable_depth):
     """
     Assemble data and generate meta-information.
     
     Args:
-        dataset_name: Name of dataset file
+        dataset_name: Name of dataset (e.g., 'nations', 'umls')
+        dataset_file: Name of dataset file (e.g., 'nations.nl')
         predicate: Target predicate name
         variable_depth: Depth of variable relationships
-        data_dir: Directory containing data
         
     Returns:
         int: 0 if successful
@@ -604,12 +608,24 @@ def data_assemble(dataset_name, predicate, variable_depth, data_dir):
     Raises:
         NameError: If data generation takes too long
     """
+    # Construct paths
+    dataset_dir = os.path.join('datasets', dataset_name)
+    input_path = os.path.join(dataset_dir, dataset_file)
+    output_dir = os.path.join(dataset_dir, predicate)
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    logger.info(f"Reading dataset from: {input_path}")
+    logger.info(f"Saving results to: {output_dir}")
+    
     _, target_arity, head_pre = main_processing(
-        dataset_name, 
+        dataset_file, 
         t_relation=predicate, 
-        path_name=data_dir,
-        original_data_path=data_dir, 
-        variable_depth=variable_depth
+        path_name=output_dir,
+        original_data_path=output_dir, 
+        variable_depth=variable_depth,
+        input_dataset_path=dataset_dir
     )
     
     if target_arity == -1 and head_pre == -1:
@@ -619,10 +635,10 @@ def data_assemble(dataset_name, predicate, variable_depth, data_dir):
     # Save meta-information
     meta_info = {'target_arity': target_arity, "head_pre": head_pre}
     
-    with open(os.path.join(data_dir, "meta_info.dt"), 'wb') as f:
+    with open(os.path.join(output_dir, "meta_info.dt"), 'wb') as f:
         pickle.dump(meta_info, f)
     
-    with open(os.path.join(data_dir, "meta_info.txt"), 'w') as f:
+    with open(os.path.join(output_dir, "meta_info.txt"), 'w') as f:
         print(meta_info, file=f)
     
     logger.info(f"Generated all trainable data successfully with variable depth: {variable_depth}")
@@ -638,13 +654,13 @@ def parse_args():
     )
     
     parser.add_argument('--dataset_name', type=str, required=True,
+                        help='Name of the dataset (e.g., nations, umls)')
+    parser.add_argument('--dataset_file', type=str, required=True,
                         help='Name of the dataset file (e.g., nations.nl)')
     parser.add_argument('--predicate', type=str, required=True,
                         help='Target predicate/relation name')
     parser.add_argument('--variable_depth', type=int, default=2,
                         help='Depth of variable relationships (usually 2 for binary predicates)')
-    parser.add_argument('--data_dir', type=str, default='test_dir/',
-                        help='Directory containing dataset and for saving outputs')
     
     return parser.parse_args()
 
@@ -656,28 +672,27 @@ def main():
     logger.info("="*80)
     logger.info("Third-Party Data Preprocessing")
     logger.info("="*80)
-    logger.info(f"Dataset: {args.dataset_name}")
+    logger.info(f"Dataset Name: {args.dataset_name}")
+    logger.info(f"Dataset File: {args.dataset_file}")
     logger.info(f"Target Predicate: {args.predicate}")
     logger.info(f"Variable Depth: {args.variable_depth}")
-    logger.info(f"Data Directory: {args.data_dir}")
+    logger.info(f"Input Directory: datasets/{args.dataset_name}/")
+    logger.info(f"Output Directory: datasets/{args.dataset_name}/{args.predicate}/")
     logger.info("="*80)
-    
-    # Create data directory if it doesn't exist
-    os.makedirs(args.data_dir, exist_ok=True)
     
     # Run data assembly
     try:
         result = data_assemble(
             dataset_name=args.dataset_name,
+            dataset_file=args.dataset_file,
             predicate=args.predicate,
-            variable_depth=args.variable_depth,
-            data_dir=args.data_dir
+            variable_depth=args.variable_depth
         )
         
         if result == 0:
             logger.info("="*80)
             logger.info("Data preprocessing completed successfully!")
-            logger.info(f"Output files saved to: {args.data_dir}")
+            logger.info(f"Output files saved to: datasets/{args.dataset_name}/{args.predicate}/")
             logger.info("="*80)
         
     except NameError as e:

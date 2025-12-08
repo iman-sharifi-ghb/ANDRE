@@ -17,3 +17,9 @@ archiv/
 alphailp/
 
 saved_models/
+
+*.json
+
+datasets/
+
+test_dir/
