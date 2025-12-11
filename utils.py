@@ -354,7 +354,7 @@ def compute_acc_ratio_all_rules_attention(model, x, y, beta=20.0, lambda_ = 10.0
             conjunctions = torch.stack(conjunctions, dim=1)  # (batch, num_neurons)
             attention_weights = torch.softmax(-beta * conjunctions, dim=1)
             outputs = (attention_weights * conjunctions).sum(dim=1)  # (batch,)
-            activated_outputs = torch.sigmoid(5 * (outputs - 0.5))
+            activated_outputs = torch.sigmoid(lambda_ * (outputs - 0.5))
             rule_outputs.append(activated_outputs)
 
         # Stack rule outputs: shape (num_rules, batch)
@@ -477,3 +477,285 @@ def extract_rules(Weights_andre, X_train, dataset_type, body_predicates, head_pr
     final_rule = f"{head_predicate} :- " + " OR ".join(Final_rules) + "."
 
     return final_rule
+
+
+def compute_mrr(scores, labels, rule_confidences):
+    """
+    Compute Mean Reciprocal Rank (MRR) for rule ranking.
+    
+    Rules are ranked globally by their confidence scores (e.g., validation accuracy).
+    For each sample, we find the rank of the first rule that correctly predicts it.
+    
+    Args:
+        scores: numpy array of shape (num_samples, num_rules) with rule predictions
+        labels: numpy array of shape (num_samples,) with binary labels
+        rule_confidences: numpy array of shape (num_rules,) with rule confidence scores
+        
+    Returns:
+        mrr: Mean Reciprocal Rank across all samples
+        reciprocal_ranks: array of reciprocal ranks for each sample
+    """
+    num_samples, num_rules = scores.shape
+    reciprocal_ranks = []
+    
+    # Rank rules globally by confidence (descending order)
+    ranked_rule_indices = np.argsort(-rule_confidences)
+    
+    for i in range(num_samples):
+        sample_scores = scores[i]
+        label = labels[i]
+        
+        # Find the rank of the first rule that correctly predicts this sample
+        rank = None
+        for r, rule_idx in enumerate(ranked_rule_indices, start=1):
+            # Check if this rule correctly predicts the sample
+            prediction = sample_scores[rule_idx]
+            is_correct = (prediction > 0.5 and label == 1) or (prediction <= 0.5 and label == 0)
+            
+            if is_correct:
+                rank = r
+                break
+        
+        if rank is not None:
+            reciprocal_ranks.append(1.0 / rank)
+        else:
+            reciprocal_ranks.append(0.0)
+    
+    mrr = np.mean(reciprocal_ranks)
+    return mrr, np.array(reciprocal_ranks)
+
+
+def compute_hits_at_k(scores, labels, rule_confidences, k_values=[1, 3, 5, 10]):
+    """
+    Compute Hits@K metric for rule ranking.
+    
+    Hits@K measures the proportion of samples where at least one correct rule
+    appears in the top-K ranked rules (by confidence).
+    
+    Args:
+        scores: numpy array of shape (num_samples, num_rules) with rule predictions
+        labels: numpy array of shape (num_samples,) with binary labels
+        rule_confidences: numpy array of shape (num_rules,) with rule confidence scores
+        k_values: list of K values to compute Hits@K for
+        
+    Returns:
+        hits_at_k: dictionary mapping K -> Hits@K score
+    """
+    num_samples, num_rules = scores.shape
+    hits_at_k = {k: 0.0 for k in k_values}
+    
+    # Rank rules globally by confidence (descending order)
+    ranked_rule_indices = np.argsort(-rule_confidences)
+    
+    for i in range(num_samples):
+        sample_scores = scores[i]
+        label = labels[i]
+        
+        for k in k_values:
+            # Check if any of the top-K rules correctly predict this sample
+            top_k_indices = ranked_rule_indices[:k]
+            found_correct = False
+            
+            for rule_idx in top_k_indices:
+                prediction = sample_scores[rule_idx]
+                is_correct = (prediction > 0.5 and label == 1) or (prediction <= 0.5 and label == 0)
+                
+                if is_correct:
+                    found_correct = True
+                    break
+            
+            if found_correct:
+                hits_at_k[k] += 1
+    
+    # Normalize by number of samples
+    for k in k_values:
+        hits_at_k[k] /= num_samples
+    
+    return hits_at_k
+
+
+def compute_ranking_metrics(scores, labels, rule_confidences, k_values=[1, 3, 5, 10]):
+    """
+    Compute both MRR and Hits@K metrics for rule ranking.
+    
+    Args:
+        scores: numpy array of shape (num_samples, num_rules) with rule predictions
+        labels: numpy array of shape (num_samples,) with binary labels
+        rule_confidences: numpy array of shape (num_rules,) with rule confidence scores
+        k_values: list of K values to compute Hits@K for
+        
+    Returns:
+        metrics: dictionary containing 'mrr' and 'hits_at_k'
+    """
+    mrr, reciprocal_ranks = compute_mrr(scores, labels, rule_confidences)
+    hits_at_k = compute_hits_at_k(scores, labels, rule_confidences, k_values)
+    
+    return {
+        'mrr': mrr,
+        'hits_at_k': hits_at_k,
+        'reciprocal_ranks': reciprocal_ranks
+    }
+
+
+def print_ranking_metrics(metrics, dataset_name="Dataset"):
+    """
+    Pretty print ranking metrics.
+    
+    Args:
+        metrics: dictionary from compute_ranking_metrics
+        dataset_name: name of the dataset for display
+    """
+    print(f"\n{'='*60}")
+    print(f"RANKING METRICS - {dataset_name}")
+    print(f"{'='*60}")
+    print(f"MRR (Mean Reciprocal Rank): {metrics['mrr']:.4f}")
+    print(f"{'-'*60}")
+    print("Hits@K:")
+    for k, score in sorted(metrics['hits_at_k'].items()):
+        print(f"  Hits@{k:2d}: {score:.4f}")
+    print(f"{'='*60}")
+
+
+def extract_variables_from_predicate(predicate):
+    """
+    Extract variable indices from a predicate string.
+    
+    Args:
+        predicate: string like "father(X1, X2)" or "grandparent(X1, X3)"
+        
+    Returns:
+        list of variable indices (e.g., [0, 1] for X1, X2)
+    """
+    # Extract the part inside parentheses
+    match = re.search(r'\((.*?)\)', predicate)
+    if not match:
+        return []
+    
+    args = match.group(1).split(',')
+    variables = []
+    for arg in args:
+        arg = arg.strip()
+        # Extract number from X1, X2, etc.
+        var_match = re.search(r'X(\d+)', arg)
+        if var_match:
+            var_idx = int(var_match.group(1)) - 1  # Convert to 0-indexed
+            variables.append(var_idx)
+    
+    return variables
+
+
+def count_variable_occurrences_in_rule_text(rule_text):
+    """
+    Count how many times each variable appears in a rule text.
+    
+    Args:
+        rule_text: rule string like "grandparent(X1, X3) :- father(X1, X2) and mother(X2, X3)."
+        
+    Returns:
+        dict mapping variable index to occurrence count
+    """
+    # Extract all variable references (X1, X2, etc.)
+    var_matches = re.findall(r'X(\d+)', rule_text)
+    var_counts = {}
+    for var_str in var_matches:
+        var_idx = int(var_str) - 1  # Convert to 0-indexed
+        var_counts[var_idx] = var_counts.get(var_idx, 0) + 1
+    
+    return var_counts
+
+
+def validate_rule_by_text(rule_text, head_vars, connected_vars):
+    """
+    Validate if a rule text satisfies the required format constraints:
+    1. Head variables must appear at least once in body predicates (i.e., at least twice total)
+    2. Connected (body) variables must appear at least twice in the rule
+    
+    Args:
+        rule_text: rule string like "grandparent(X1, X3) :- father(X1, X2) and mother(X2, X3)."
+        head_vars: list of head variable indices (e.g., [0, 2] for X1, X3 in grandparent(X1,X3))
+        connected_vars: list of connected/body variable indices (e.g., [1] for X2)
+        
+    Returns:
+        bool: True if rule is valid, False otherwise
+        str: Reason for invalidity (or "Valid" if valid)
+    """
+    if not rule_text or ':-' not in rule_text:
+        return False, "Invalid rule format (no ':-' separator)"
+    
+    # Split into head and body
+    parts = rule_text.split(':-')
+    if len(parts) != 2:
+        return False, "Invalid rule format"
+    
+    head_part = parts[0].strip()
+    body_part = parts[1].strip()
+    
+    # Count variables in the entire rule
+    total_var_counts = count_variable_occurrences_in_rule_text(rule_text)
+    
+    # Count variables only in the body
+    body_var_counts = count_variable_occurrences_in_rule_text(body_part)
+    
+    # Check constraint 1: Head variables must appear at least once in body
+    # (which means at least twice total: once in head, once in body)
+    for head_var in head_vars:
+        body_count = body_var_counts.get(head_var, 0)
+        if body_count != 1:
+            return False, f"Head variable X{head_var+1} appears {body_count} times in body (need ≥1)"
+    
+    # Check constraint 2: Connected variables must appear at least twice
+    for conn_var in connected_vars:
+        total_count = total_var_counts.get(conn_var, 0)
+        if total_count == 1:
+            return False, f"Connected variable X{conn_var+1} appears {total_count} times (need ≥2)"
+    
+    return True, "Valid"
+
+
+def filter_valid_rules(all_rules, head_vars, connected_vars, verbose=True):
+    """
+    Filter rules to keep only those that satisfy format constraints based on rule text.
+    
+    Args:
+        all_rules: list of rule dictionaries (each with 'rule' text and other fields)
+        head_vars: list of head variable indices
+        connected_vars: list of connected/body variable indices
+        verbose: whether to print filtering statistics
+        
+    Returns:
+        valid_rules: list of valid rule dictionaries
+        invalid_rules: list of invalid rule dictionaries with 'invalid_reason' added
+    """
+    valid_rules = []
+    invalid_rules = []
+    
+    for rule_info in all_rules:
+        rule_text = rule_info.get('rule', '')
+        
+        # Validate the rule by text
+        is_valid, reason = validate_rule_by_text(rule_text, head_vars, connected_vars)
+        
+        if is_valid:
+            valid_rules.append(rule_info)
+        else:
+            rule_info_copy = rule_info.copy()
+            rule_info_copy['invalid_reason'] = reason
+            invalid_rules.append(rule_info_copy)
+    
+    if verbose:
+        print(f"\n{'='*70}")
+        print("RULE VALIDATION RESULTS")
+        print(f"{'='*70}")
+        print(f"Total rules: {len(all_rules)}")
+        print(f"Valid rules: {len(valid_rules)}")
+        print(f"Invalid rules: {len(invalid_rules)}")
+        
+        if invalid_rules:
+            print(f"\n{'-'*70}")
+            print("Invalid rules and reasons:")
+            for i, rule_info in enumerate(invalid_rules, 1):
+                print(f"\n{i}. {rule_info['rule']}")
+                print(f"   Reason: {rule_info['invalid_reason']}")
+        print(f"{'='*70}")
+    
+    return valid_rules, invalid_rules
