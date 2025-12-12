@@ -8,6 +8,8 @@ for learning logical rules from data using neural networks.
 import argparse
 import math
 import pickle
+import os
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,10 +20,12 @@ from collections import Counter
 from utils import check_binary_dataset, create_V_matrix
 from utils import plot_andre_weights
 from utils import interpret_neuron_weights_entropy, interpret_neuron_weights
-from utils import compute_acc_ratio_all_rules_attention
 from utils import extract_rules
 from utils import parse_rule_and_generate_data
+from utils import compute_ranking_metrics, print_ranking_metrics
+from utils import filter_valid_rules
 import numpy as np
+import pandas as pd
 from datetime import datetime
 
 
@@ -99,7 +103,7 @@ def parse_args():
                         help='Visualize learned weights')
     parser.add_argument('--verbose', type=str2bool, default=True,
                         help='Print verbose output')
-    parser.add_argument('--save_model', type=str2bool, default=True,
+    parser.add_argument('--save_model', type=str2bool, default=False,
                         help='Save the best model')
     parser.add_argument('--save_dir', type=str, default='saved_models',
                         help='Directory to save models')
@@ -113,6 +117,9 @@ def parse_args():
     # Evaluation options
     parser.add_argument('--evaluate_individual_rules', type=str2bool, default=False,
                         help='Evaluate and sort individual rules by accuracy')
+    parser.add_argument('--rule_confidence_metric', type=str, default='val_accuracy',
+                        choices=['val_accuracy', 'val_f1', 'train_accuracy', 'val_precision'],
+                        help='Metric to use as rule confidence for ranking (MRR/Hits@K)')
     
     return parser.parse_args()
 
@@ -554,7 +561,14 @@ def main():
                 model.scheduler.step()
                 losses_andre.append(epoch_loss)
 
-            # Extract rules from this trained model
+            # Extract RAW weights from model parameters (not softmaxed)
+            Weights_andre_raw = []
+            for rule_block in model.rules:
+                # Get raw_weights from the activation layer [D, 3]
+                raw_w = rule_block.activation.raw_weights.detach().cpu().numpy()
+                Weights_andre_raw.append(raw_w.tolist())
+
+            # Extract softmaxed weights for rule interpretation
             Weights_andre = []
             for rule_weights in model_weights:
                 rule_weights = rule_weights.detach().cpu().numpy()
@@ -624,7 +638,8 @@ def main():
                         'training_f1': subrule_metrics['f1_score'],
                         'eval_precision': subrule_eval_metrics['precision'],
                         'eval_recall': subrule_eval_metrics['recall'],
-                        'eval_f1': subrule_eval_metrics['f1_score']
+                        'eval_f1': subrule_eval_metrics['f1_score'],
+                        'weights': Weights_andre_raw[rule_idx]  # Store RAW weights, not softmaxed
                     })
 
             print(f"Num Rules: {num_rules + 1}, Restart {restart+1}/{num_restarts}, Train Metric: {train_metric:.4f}, Evaluation Metric: {eval_metric:.4f}.")
@@ -661,15 +676,16 @@ def main():
     best_model.print_evaluation(X_val, y_val)
 
     # Plot loss curve
-    plt.figure(figsize=(8, 5))
-    plt.plot(range(1, num_epochs + 1), best_losses, label="Loss", color="blue")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.title(f"Training Loss - ({best_num_rules} Rules)")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(f"{args.save_dir}/loss_curve_{today_date}_{today_hour}.png")
-    plt.show()
+    if visualize_weights:
+        plt.figure(figsize=(8, 5))
+        plt.plot(range(1, num_epochs + 1), best_losses, label="Loss", color="blue")
+        plt.xlabel("Epochs")
+        plt.ylabel("Loss")
+        plt.title(f"Training Loss - ({best_num_rules} Rules)")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{args.save_dir}/loss_curve_{today_date}_{today_hour}.png")
+        plt.show()
 
     _, andre_weights, _, _ = best_model(X_val)
 
@@ -788,6 +804,141 @@ def main():
     
     print("\n" + "="*80)
     
+    # Save sorted rule weights if save_model is enabled
+    if save_model and len(sorted_all_rules) > 0:
+        # Filter rules based on format constraints (only for structured data)
+        if structured_data and head_vars is not None and connected_vars is not None:
+            valid_rules, invalid_rules = filter_valid_rules(
+                sorted_all_rules, 
+                head_vars, 
+                connected_vars,
+                verbose=True
+            )
+            
+            # Use only valid rules for the unified model
+            if len(valid_rules) == 0:
+                print("\nWARNING: No valid rules found! Using all rules without filtering.")
+                rules_to_use = sorted_all_rules
+            else:
+                print(f"\nUsing {len(valid_rules)} valid rules for unified model (filtered from {len(sorted_all_rules)} total rules)")
+                rules_to_use = valid_rules
+        else:
+            print("\nSkipping rule validation (not structured data or head_vars/connected_vars not available)")
+            rules_to_use = sorted_all_rules
+        
+        save_dir_rules = f"{args.save_dir}/sorted_rules_{today_date}_{today_hour}"
+        os.makedirs(save_dir_rules, exist_ok=True)
+        
+        # Prepare rule weights for export (nested list format)
+        sorted_rule_weights = [rule_info['weights'] for rule_info in rules_to_use]
+        
+        # Build a unified model from sorted rules
+        unified_model = ANDRE.build_from_rule_weights(
+            sorted_rule_weights,
+            pot_body_pred_dim=input_dim,
+            variable_matrix=variable_matrix if structured_data else None
+        )
+        unified_model = unified_model.to(device)
+        
+        # Export the sorted rule weights
+        pt_path, json_path = unified_model.export_rule_weights(save_dir_rules, file_prefix="sorted_rules")
+        
+        # Save metadata about valid rules used in unified model
+        rules_metadata = []
+        for rank, rule_info in enumerate(rules_to_use, 1):
+            # Create serializable copy (exclude weights from JSON metadata)
+            metadata_entry = {k: v for k, v in rule_info.items() if k != 'weights'}
+            metadata_entry['rank'] = rank
+            rules_metadata.append(metadata_entry)
+        
+        metadata_path = os.path.join(save_dir_rules, "sorted_rules_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(rules_metadata, f, indent=2)
+        
+        # Compute and save per-sample scores for the unified sorted model
+        print("\nComputing per-sample scores for sorted rules...")
+        with torch.no_grad():
+            rule_scores_train = unified_model.get_rule_scores(X_train, apply_attention=False)
+            scores_train_np = rule_scores_train.cpu().numpy().T  # [B, R]
+            
+            rule_scores_val = unified_model.get_rule_scores(X_val, apply_attention=False)
+            scores_val_np = rule_scores_val.cpu().numpy().T  # [B, R]
+            
+            # Adjust scores based on labels: score * y + (1 - score) * (1 - y)
+            y_train_np = y_train.cpu().numpy().reshape(-1, 1)  # [B, 1]
+            y_val_np = y_val.cpu().numpy().reshape(-1, 1)  # [B, 1]
+            
+            adjusted_scores_train = scores_train_np * y_train_np + (1 - scores_train_np) * (1 - y_train_np)
+            adjusted_scores_val = scores_val_np * y_val_np + (1 - scores_val_np) * (1 - y_val_np)
+            
+            df_train = pd.DataFrame(adjusted_scores_train,
+                                   columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+            df_train['label'] = y_train.cpu().numpy()
+            df_train.to_csv(os.path.join(save_dir_rules, "train_sorted_rule_scores.csv"), index=False)
+            
+            df_val = pd.DataFrame(adjusted_scores_val,
+                                 columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+            df_val['label'] = y_val.cpu().numpy()
+            df_val.to_csv(os.path.join(save_dir_rules, "val_sorted_rule_scores.csv"), index=False)
+        
+        # Compute ranking metrics (MRR and Hits@K)
+        print("\n" + "="*70)
+        print("Computing ranking metrics...")
+        
+        # Print valid rules being used
+        print(f"\nValid rules used for unified model ({len(rules_to_use)} rules):")
+        for idx, rule_info in enumerate(rules_to_use, 1):
+            print(f"  [{idx}] {rule_info['rule']}")
+            print(f"      Training Acc: {rule_info['training_accuracy']:.4f} | Eval Acc: {rule_info['eval_accuracy']:.4f}")
+        
+        # Extract rule confidences based on selected metric
+        confidence_metric_map = {
+            'val_accuracy': 'eval_accuracy',
+            'val_f1': 'eval_f1',
+            'train_accuracy': 'training_accuracy',
+            'val_precision': 'eval_precision'
+        }
+        confidence_key = confidence_metric_map[args.rule_confidence_metric]
+        rule_confidences = np.array([rule[confidence_key] for rule in rules_metadata])
+        
+        print(f"\nUsing '{args.rule_confidence_metric}' as rule confidence metric")
+        print(f"Rule confidences: {rule_confidences}")
+        
+        # Training set metrics
+        train_metrics = compute_ranking_metrics(adjusted_scores_train, y_train.cpu().numpy(), 
+                                                rule_confidences, k_values=[1, 3, 5, 10])
+        print_ranking_metrics(train_metrics, dataset_name="Training Set")
+        
+        # Validation set metrics
+        val_metrics = compute_ranking_metrics(adjusted_scores_val, y_val.cpu().numpy(),
+                                              rule_confidences, k_values=[1, 3, 5, 10])
+        print_ranking_metrics(val_metrics, dataset_name="Validation Set")
+        
+        # Save ranking metrics to JSON
+        ranking_metrics_path = os.path.join(save_dir_rules, "ranking_metrics.json")
+        ranking_results = {
+            'confidence_metric': args.rule_confidence_metric,
+            'rule_confidences': rule_confidences.tolist(),
+            'training': {
+                'mrr': float(train_metrics['mrr']),
+                'hits_at_k': {int(k): float(v) for k, v in train_metrics['hits_at_k'].items()}
+            },
+            'validation': {
+                'mrr': float(val_metrics['mrr']),
+                'hits_at_k': {int(k): float(v) for k, v in val_metrics['hits_at_k'].items()}
+            }
+        }
+        with open(ranking_metrics_path, 'w') as f:
+            json.dump(ranking_results, f, indent=2)
+        
+        print(f"\nSaved sorted rule weights and scores to: {save_dir_rules}")
+        print(f"  - {pt_path}")
+        print(f"  - {json_path}")
+        print(f"  - {metadata_path}")
+        print(f"  - train_sorted_rule_scores.csv")
+        print(f"  - val_sorted_rule_scores.csv")
+        print(f"  - {ranking_metrics_path}")
+    
     # Return the list for programmatic access
     return all_discovered_rules
 
@@ -797,7 +948,6 @@ if __name__ == '__main__':
     
     # Optional: Save to file
     if all_rules:
-        import json
         with open('discovered_rules.json', 'w') as f:
             json.dump(all_rules, f, indent=2)
         print(f"\nSaved {len(all_rules)} discovered rules to 'discovered_rules.json'")
