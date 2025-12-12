@@ -320,3 +320,154 @@ class ANDRE(nn.Module):
         print(f"  - Num Rules: {config['num_rules']}, Input Dim: {config['input_dim']}")
         
         return model
+
+    def export_rule_weights(self, save_dir, file_prefix="rules"):
+        """
+        Export raw rule weights from each `RuleBlock.activation.raw_weights`.
+
+        Saves two files in `save_dir`:
+          - `{file_prefix}_weights.pt`: torch-saved dict of raw tensors
+          - `{file_prefix}_weights.json`: same data serialized as plain lists
+
+        Returns tuple(paths)
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        pt_dict = {}
+        json_dict = {'rules': []}
+
+        for r_idx, rule_block in enumerate(self.rules):
+            activation = rule_block.activation
+            # activation.raw_weights: [D, 3]
+            raw = activation.raw_weights.detach().cpu()
+            D = raw.shape[0]
+            rule_list = []
+            for n_idx in range(D):
+                vec = raw[n_idx]
+                key = f"rule_{r_idx}_neuron_{n_idx}"
+                pt_dict[key] = vec.clone()
+                rule_list.append(vec.tolist())
+            json_dict['rules'].append(rule_list)
+
+        pt_path = os.path.join(save_dir, f"{file_prefix}_weights.pt")
+        torch.save(pt_dict, pt_path)
+
+        json_path = os.path.join(save_dir, f"{file_prefix}_weights.json")
+        with open(json_path, 'w') as f:
+            json.dump(json_dict, f, indent=2)
+
+        print(f"Exported rule raw-weights to: {pt_path} and {json_path}")
+        return pt_path, json_path
+
+    @staticmethod
+    def load_rule_weights(path_or_dict):
+        """
+        Load rule weights saved by `export_rule_weights`.
+
+        Accepts a path to a .pt file (dict of tensors) or a dict/list structure
+        (for example JSON parsed into a dict). Returns nested list: rules -> neurons -> [w0,w1,w2].
+        """
+        # If given a .pt file
+        if isinstance(path_or_dict, str):
+            if not os.path.exists(path_or_dict):
+                raise FileNotFoundError(path_or_dict)
+            loaded = torch.load(path_or_dict)
+            rules = {}
+            for k, v in loaded.items():
+                parts = k.split('_')
+                try:
+                    r = int(parts[1])
+                    n = int(parts[3])
+                except Exception:
+                    continue
+                rules.setdefault(r, {})[n] = v.tolist()
+
+            ordered = []
+            for r_idx in sorted(rules.keys()):
+                neuron_map = rules[r_idx]
+                ordered.append([neuron_map[n_idx] for n_idx in sorted(neuron_map.keys())])
+            return ordered
+
+        # If dict-like (JSON loaded)
+        if isinstance(path_or_dict, dict):
+            if 'rules' in path_or_dict:
+                return path_or_dict['rules']
+
+        # If already in nested-list format, return as-is
+        return path_or_dict
+
+    @classmethod
+    def build_from_rule_weights(cls, rule_weights, pot_body_pred_dim, variable_matrix=None,
+                                beta=20, lambda_=10, lr=0.005, weight_decay=1e-5):
+        """
+        Construct an `ANDRE` instance from `rule_weights`.
+
+        `rule_weights` should be a list of rules (length R), each rule is a list of D neurons,
+        and each neuron is an iterable of length 3 (raw weights).
+        `pot_body_pred_dim` should match D used during training/data creation.
+        """
+        num_rules = len(rule_weights)
+        model = cls(num_rules=num_rules, pot_body_pred_dim=pot_body_pred_dim,
+                    variable_matrix=variable_matrix, beta=beta, lambda_=lambda_,
+                    lr=lr, weight_decay=weight_decay)
+
+        # Assign raw_weights into each RuleBlock.activation.raw_weights
+        for r_idx, rule in enumerate(rule_weights):
+            if r_idx >= len(model.rules):
+                break
+            activation = model.rules[r_idx].activation
+            # activation.raw_weights: [D,3]
+            D = activation.raw_weights.shape[0]
+            # Prepare a tensor of same shape and fill
+            with torch.no_grad():
+                for n_idx, neuron_w in enumerate(rule):
+                    if n_idx >= D:
+                        break
+                    vec = torch.tensor(neuron_w, dtype=activation.raw_weights.dtype)
+                    activation.raw_weights.data[n_idx].copy_(vec)
+
+        model.eval()
+        return model
+
+    def get_neuron_weights(self, softmaxed=True):
+        """
+        Return activation weights for all rules.
+
+        Returns nested list: rules -> neurons -> [w0,w1,w2]
+        """
+        out = []
+        for rule_block in self.rules:
+            raw = rule_block.activation.raw_weights.detach().cpu()
+            if softmaxed:
+                w = torch.softmax(raw, dim=1).tolist()
+            else:
+                w = raw.tolist()
+            out.append(w)
+        return out
+
+    def get_rule_scores(self, x, apply_attention=True):
+        """
+        Compute per-rule scores for each sample in `x`.
+
+        Returns a tensor of shape (R, B) where R=num_rules and B=batch size.
+        If `apply_attention` is True, rule-level attention is applied (same as forward).
+        """
+        B, D = x.shape
+        X1 = x
+        X2 = 1 - x
+        X3 = torch.ones_like(x)
+        X_basis = torch.stack([X1, X2, X3], dim=2)  # [B, D, 3]
+
+        rule_vals = []
+        for r_idx, rule_block in enumerate(self.rules):
+            r_out, weights, entropy, P, M = rule_block(X_basis, self.beta, self.lambda_, GAMMA1, self.V)
+            # r_out: [B]
+            rule_vals.append(r_out)
+
+        stacked = torch.stack(rule_vals, dim=0)  # [R, B]
+
+        if apply_attention:
+            # compute attention across rules per sample: softmax over R for each sample
+            attn = torch.softmax(self.beta * stacked, dim=0)  # [R, B]
+            stacked = attn * stacked
+
+        return stacked
