@@ -659,7 +659,7 @@ def parse_args():
                         help='Name of the dataset file (e.g., nations.nl)')
     parser.add_argument('--predicate', type=str, required=True,
                         help='Target predicate/relation name')
-    parser.add_argument('--variable_depth', type=int, default=2,
+    parser.add_argument('--variable_depth', type=int, default=1,
                         help='Depth of variable relationships (usually 2 for binary predicates)')
     
     return parser.parse_args()
