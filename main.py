@@ -24,6 +24,7 @@ from utils import extract_rules
 from utils import parse_rule_and_generate_data
 from utils import compute_ranking_metrics, print_ranking_metrics
 from utils import filter_valid_rules
+from utils import extract_head_and_connected_vars
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -57,6 +58,8 @@ def parse_args():
                         help='Type of dataset')
     parser.add_argument('--data_path', type=str, default='test_dir/',
                         help='Path to data directory (for non-synthetic data)')
+    parser.add_argument('--head_predicate', type=str, default='grandparent(X1, X3)',
+                        help='Head predicate for structured data (e.g., "grandparent(X1, X3)")')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
     
@@ -97,6 +100,9 @@ def parse_args():
                         help='Weight decay for optimizer')
     parser.add_argument('--acc_threshold', type=float, default=0.98,
                         help='Accuracy threshold for early stopping')
+    parser.add_argument('--best_model_criterion', type=str, default='val_loss',
+                        choices=['val_loss', 'train_loss'],
+                        help='Criterion to select best model: validation loss or training loss')
     
     # Output options
     parser.add_argument('--visualize_weights', type=str2bool, default=False,
@@ -105,8 +111,6 @@ def parse_args():
                         help='Print verbose output')
     parser.add_argument('--save_model', type=str2bool, default=False,
                         help='Save the best model')
-    parser.add_argument('--save_dir', type=str, default='saved_models',
-                        help='Directory to save models')
     
     # Device options
     parser.add_argument('--device', type=str, default='cpu', choices=['auto', 'cpu', 'cuda'],
@@ -220,6 +224,15 @@ def main():
     today_date = datetime.now().strftime("%Y-%m-%d")
     today_hour = datetime.now().strftime("%H-%M-%S")
 
+    # Set up directories based on data source
+    base_path = args.data_path.rstrip('/')
+    results_dir = os.path.join(base_path, 'results')
+    models_dir = os.path.join(base_path, 'saved_models')
+    
+    # Create directories if they don't exist
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+
     # Set device
     if args.force_cpu:
         device = torch.device("cpu")
@@ -266,10 +279,9 @@ def main():
         else:
             body_predicates = ["father(X1, X2)", "father(X2, X3)", "father(X1, X3)", 
                              "mother(X1, X2)", "mother(X2, X3)", "mother(X1, X3)"]
-            head_predicate = "grandparent(X1, X3)"
+            head_predicate = args.head_predicate
             variable_matrix, variables = create_V_matrix(body_predicates)
-            head_vars = [0, 2]
-            connected_vars = [1]
+            head_vars, connected_vars = extract_head_and_connected_vars(head_predicate, variables)
             input_dim = len(body_predicates)
             body_predicates = body_predicates
             head_predicate = head_predicate
@@ -368,12 +380,12 @@ def main():
         # check if the length of body_predicates matches the number of columns in X_train
         assert len(body_predicates) == X_train.shape[1], "Mismatch between body predicates and X_train columns."
         variable_matrix, variables = create_V_matrix(body_predicates)
-        head_vars = [0, 1]
-        connected_vars = [2, 3]
+        head_predicate = args.head_predicate
+        head_vars, connected_vars = extract_head_and_connected_vars(head_predicate, variables)
 
         input_dim = X_train.shape[1]
         num_samples = X_train.shape[0]
-        acc_threshold = 0.95
+        acc_threshold = args.acc_threshold
 
     # Remove predicates containing 'X4' (only for non-synthetic structured data)
     if not synthetic_data and structured_data:
@@ -386,8 +398,7 @@ def main():
             # Update body_predicates
             body_predicates = [body_predicates[i] for i in indices_keep]
             variable_matrix, variables = create_V_matrix(body_predicates)
-            head_vars = [0, 1]
-            connected_vars = [2]
+            head_vars, connected_vars = extract_head_and_connected_vars(head_predicate, variables)
             # Update X_train (keep columns corresponding to indices_keep)
             X_train = X_train[:, indices_keep].clone()
             # Update input_dim
@@ -438,7 +449,8 @@ def main():
     best_eval_metric = -float('inf')
     best_train_metric = -float('inf')
     best_overall_metric = -float('inf')
-    best_losses = []
+    best_losses_train = []
+    best_losses_val = []
     
     # Store all discovered rules with their accuracies
     all_discovered_rules = []
@@ -451,7 +463,8 @@ def main():
                          lr=args.lr, weight_decay=args.weight_decay)
             model = model.to(device)
 
-            losses_andre = []
+            losses_andre_train = []
+            losses_andre_val = []
 
             for epoch in range(num_epochs):
                 model.train()
@@ -559,7 +572,84 @@ def main():
                     epoch_loss += total_loss.item()
 
                 model.scheduler.step()
-                losses_andre.append(epoch_loss)
+                losses_andre_train.append(epoch_loss)
+                
+                # Compute validation loss
+                model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for i in range(0, X_val.size(0), batch_size):
+                        xb_val = X_val[i:i + batch_size]
+                        yb_val = y_val[i:i + batch_size]
+                        
+                        outputs_val, model_weights_val, weight_entropies_val, Ms_val = model(xb_val)
+                        bce_loss_val = model.criterion(outputs_val, yb_val)
+                        
+                        # Compute other loss components for validation
+                        if structured_data:
+                            # Similarity Penalty
+                            sim_loss_val = 0.0
+                            num_sim_pairs = 0
+                            for i_r in range(num_rules + 1):
+                                wi = model_weights_val[i_r].view(input_dim, -1)
+                                for j_r in range(i_r + 1, num_rules + 1):
+                                    wj = model_weights_val[j_r].view(input_dim, -1)
+                                    sim_loss_val += nn.CosineSimilarity(dim=1)(wi, wj).mean()
+                                    num_sim_pairs += 1
+                            sim_loss_val = sim_loss_val / num_sim_pairs if num_sim_pairs > 0 else 0
+                            
+                            # Range Restriction Loss
+                            M_head_list_val = [torch.as_tensor(Ms_val[i_r][head_vars], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules + 1)]
+                            M_head_val = torch.stack(M_head_list_val)
+                            eta = 0.5
+                            mask_below = (M_head_val < 1.0).float()
+                            mask_above = (M_head_val >= 1.0).float()
+                            rr_loss_val = mask_below * (M_head_val - 1.0)**2 + mask_above * eta * (M_head_val - 1.0)
+                            rr_loss_val = rr_loss_val.sum() / len(head_vars) / (num_rules + 1)
+                            
+                            # Connectivity Loss
+                            M_connected_list_val = [torch.as_tensor(Ms_val[i_r][connected_vars], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules + 1)]
+                            M_connected_val = torch.stack(M_connected_list_val)
+                            mask_below_2 = (M_connected_val < 2.0).float()
+                            mask_above_2 = (M_connected_val >= 2.0).float()
+                            conn_loss_1_val = torch.stack([torch.exp(-0.5 * ((M_conn - 1.0) / 0.2)**2) / (0.2 * math.sqrt(2 * math.pi)) for M_conn in M_connected_val]).sum()
+                            conn_loss_1_val = 0.5 * conn_loss_1_val
+                            conn_loss_2_val = (M_connected_val - 2.0)**2
+                            conn_loss_val = mask_below_2 * conn_loss_1_val + mask_above_2 * conn_loss_2_val
+                            conn_loss_val = conn_loss_val.sum() / len(connected_vars) / (num_rules + 1)
+                            
+                            # Digitization Loss
+                            M_all_list_val = [torch.as_tensor(Ms_val[i_r], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules + 1)]
+                            M_all_val = torch.stack(M_all_list_val)
+                            digit_loss_val = 0.5 * (1 - torch.sin(2 * math.pi * M_all_val + math.pi / 2)).sum()
+                            digit_loss_val = digit_loss_val / M_all_val.numel()
+                            
+                            # Entropy Loss
+                            entropy_term_val = torch.stack(weight_entropies_val).sum()
+                            entropy_term_val = entropy_term_val / (num_rules + 1) / input_dim
+                            
+                            total_loss_val = bce_loss_val + ent_weight_ * entropy_term_val + \
+                                           rr_weight_ * rr_loss_val + conn_weight_ * conn_loss_val + \
+                                           digit_weight_ * digit_loss_val + sim_weight_ * sim_loss_val
+                        else:
+                            entropy_term_val = torch.stack(weight_entropies_val).sum()
+                            entropy_term_val = entropy_term_val / (num_rules + 1) / input_dim
+                            
+                            sim_loss_val = 0.0
+                            num_sim_pairs = 0
+                            for i_r in range(num_rules + 1):
+                                wi = model_weights_val[i_r].view(input_dim, -1)
+                                for j_r in range(i_r + 1, num_rules + 1):
+                                    wj = model_weights_val[j_r].view(input_dim, -1)
+                                    sim_loss_val += nn.CosineSimilarity(dim=1)(wi, wj).mean()
+                                    num_sim_pairs += 1
+                            sim_loss_val = sim_loss_val / num_sim_pairs if num_sim_pairs > 0 else 0
+                            
+                            total_loss_val = bce_loss_val + ent_weight_ * entropy_term_val + sim_weight_ * sim_loss_val
+                        
+                        val_loss += total_loss_val.item()
+                
+                losses_andre_val.append(val_loss)
 
             # Extract RAW weights from model parameters (not softmaxed)
             Weights_andre_raw = []
@@ -647,15 +737,20 @@ def main():
             # Print current discovered subrules count
             print(f"Total unique subrules discovered so far: {len(all_discovered_rules)}")
             
-            if min(losses_andre) < best_loss:
-                print(f"**** New Best Model ****")
+            # Select best model based on chosen criterion
+            current_criterion_losses = losses_andre_val if args.best_model_criterion == 'val_loss' else losses_andre_train
+            current_min_loss = min(current_criterion_losses)
+            
+            if current_min_loss < best_loss:
+                print(f"**** New Best Model (based on {args.best_model_criterion}) ****")
                 best_eval_metric = eval_metric
                 best_train_metric = train_metric
                 best_overall_metric = overall_metric
                 best_state_dict = deepcopy(model.state_dict())
-                best_losses = losses_andre
+                best_losses_train = losses_andre_train
+                best_losses_val = losses_andre_val
                 best_num_rules = num_rules + 1
-                best_loss = min(losses_andre)
+                best_loss = current_min_loss
 
                 if train_metric > acc_threshold and eval_metric > acc_threshold:
                     print(f"The accuracy threshold of {acc_threshold} has been reached. Stopping further restarts.")
@@ -675,16 +770,17 @@ def main():
     print("\n=== Best Model Evaluation on Validation Set ===")
     best_model.print_evaluation(X_val, y_val)
 
-    # Plot loss curve
+    # Plot loss curves (both training and validation)
     if visualize_weights:
-        plt.figure(figsize=(8, 5))
-        plt.plot(range(1, num_epochs + 1), best_losses, label="Loss", color="blue")
-        plt.xlabel("Epochs")
-        plt.ylabel("Loss")
-        plt.title(f"Training Loss - ({best_num_rules} Rules)")
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(f"{args.save_dir}/loss_curve_{today_date}_{today_hour}.png")
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, num_epochs + 1), best_losses_train, label="Training Loss", color="blue", linewidth=2)
+        plt.plot(range(1, num_epochs + 1), best_losses_val, label="Validation Loss", color="orange", linewidth=2)
+        plt.xlabel("Epochs", fontsize=12)
+        plt.ylabel("Loss", fontsize=12)
+        plt.title(f"Training and Validation Loss - ({best_num_rules} Rules)", fontsize=14)
+        plt.legend(fontsize=11)
+        plt.grid(True, alpha=0.3)
+        plt.savefig(f"{results_dir}/loss_curve_{today_date}_{today_hour}.png", dpi=150, bbox_inches='tight')
         plt.show()
 
     _, andre_weights, _, _ = best_model(X_val)
@@ -709,7 +805,7 @@ def main():
 
     # Save the best model
     if save_model:
-        best_model.save_model(save_dir=f"{args.save_dir}/andre_best_model_{today_date}", 
+        best_model.save_model(save_dir=f"{models_dir}/andre_best_model_{today_date}", 
                              model_name=f"ANDRE_best_model_{today_hour}")
 
     # Evaluate individual rules and sort by accuracy
@@ -826,7 +922,7 @@ def main():
             print("\nSkipping rule validation (not structured data or head_vars/connected_vars not available)")
             rules_to_use = sorted_all_rules
         
-        save_dir_rules = f"{args.save_dir}/sorted_rules_{today_date}_{today_hour}"
+        save_dir_rules = f"{results_dir}/sorted_rules_{today_date}_{today_hour}"
         os.makedirs(save_dir_rules, exist_ok=True)
         
         # Prepare rule weights for export (nested list format)
@@ -887,9 +983,30 @@ def main():
         
         # Print valid rules being used
         print(f"\nValid rules used for unified model ({len(rules_to_use)} rules):")
+        
+        # Compute coverage statistics for each rule
+        rule_coverage_stats_val = []
+        rule_coverage_stats_train = []
+        
         for idx, rule_info in enumerate(rules_to_use, 1):
+            # Validation set statistics
+            rule_predictions_val = scores_val_np[:, idx-1] > 0.5  # Rule predicts true
+            N_b_val = np.sum(rule_predictions_val)
+            N_r_val = np.sum(rule_predictions_val & (y_val_np.flatten() == 1))
+            ratio_val = N_r_val / N_b_val if N_b_val > 0 else 0.0
+            rule_coverage_stats_val.append((int(N_b_val), int(N_r_val), float(ratio_val)))
+            
+            # Training set statistics
+            rule_predictions_train = scores_train_np[:, idx-1] > 0.5  # Rule predicts true
+            N_b_train = np.sum(rule_predictions_train)
+            N_r_train = np.sum(rule_predictions_train & (y_train_np.flatten() == 1))
+            ratio_train = N_r_train / N_b_train if N_b_train > 0 else 0.0
+            rule_coverage_stats_train.append((int(N_b_train), int(N_r_train), float(ratio_train)))
+            
             print(f"  [{idx}] {rule_info['rule']}")
             print(f"      Training Acc: {rule_info['training_accuracy']:.4f} | Eval Acc: {rule_info['eval_accuracy']:.4f}")
+            print(f"      Val Coverage: (N_b={N_b_val}, N_r={N_r_val}, N_r/N_b={ratio_val:.4f})")
+            print(f"      Train Coverage: (N_b={N_b_train}, N_r={N_r_train}, N_r/N_b={ratio_train:.4f})")
         
         # Extract rule confidences based on selected metric
         confidence_metric_map = {
@@ -919,6 +1036,8 @@ def main():
         ranking_results = {
             'confidence_metric': args.rule_confidence_metric,
             'rule_confidences': rule_confidences.tolist(),
+            'rule_coverage_stats_validation': rule_coverage_stats_val,
+            'rule_coverage_stats_training': rule_coverage_stats_train,
             'training': {
                 'mrr': float(train_metrics['mrr']),
                 'hits_at_k': {int(k): float(v) for k, v in train_metrics['hits_at_k'].items()}
@@ -940,14 +1059,15 @@ def main():
         print(f"  - {ranking_metrics_path}")
     
     # Return the list for programmatic access
-    return all_discovered_rules
+    return all_discovered_rules, results_dir
 
 
 if __name__ == '__main__':
-    all_rules = main()
+    all_rules, results_dir = main()
     
     # Optional: Save to file
     if all_rules:
-        with open('discovered_rules.json', 'w') as f:
+        discovered_rules_path = os.path.join(results_dir, 'discovered_rules.json')
+        with open(discovered_rules_path, 'w') as f:
             json.dump(all_rules, f, indent=2)
-        print(f"\nSaved {len(all_rules)} discovered rules to 'discovered_rules.json'")
+        print(f"\nSaved {len(all_rules)} discovered rules to '{discovered_rules_path}'")
