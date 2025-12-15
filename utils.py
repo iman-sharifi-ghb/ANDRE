@@ -644,6 +644,30 @@ def extract_variables_from_predicate(predicate):
     return variables
 
 
+def extract_head_and_connected_vars(head_predicate, all_variables):
+    """
+    Extract head_vars and connected_vars from head predicate and all variables.
+    
+    Args:
+        head_predicate: string like "grandparent(X1, X3)"
+        all_variables: list of all variable names like ['X1', 'X2', 'X3']
+        
+    Returns:
+        head_vars: list of variable indices that appear in head predicate (e.g., [0, 2] for X1, X3)
+        connected_vars: list of variable indices that don't appear in head (e.g., [1] for X2)
+    """
+    # Extract variables from head predicate
+    head_vars = extract_variables_from_predicate(head_predicate)
+    
+    # All variable indices
+    all_var_indices = list(range(len(all_variables)))
+    
+    # Connected vars are those not in head
+    connected_vars = [i for i in all_var_indices if i not in head_vars]
+    
+    return head_vars, connected_vars
+
+
 def count_variable_occurrences_in_rule_text(rule_text):
     """
     Count how many times each variable appears in a rule text.
