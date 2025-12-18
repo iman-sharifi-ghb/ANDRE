@@ -9,6 +9,7 @@ import argparse
 import math
 import pickle
 import os
+import sys
 import json
 import torch
 import torch.nn as nn
@@ -28,6 +29,25 @@ from utils import extract_head_and_connected_vars
 import numpy as np
 import pandas as pd
 from datetime import datetime
+
+
+class Tee:
+    """Duplicate output to both console and log file."""
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log = open(log_file, 'a')
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()  # Ensure immediate write to file
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
 
 
 def str2bool(v):
@@ -92,6 +112,8 @@ def parse_args():
                         help='Weight for connectivity loss')
     parser.add_argument('--digit_weight', type=float, default=0.01,
                         help='Weight for digitization loss')
+    parser.add_argument('--pp', type=float, default=0.1,
+                        help='Perturbation parameter for synthetic data preprocessing')
     
     # Optimization
     parser.add_argument('--lr', type=float, default=0.01,
@@ -122,8 +144,8 @@ def parse_args():
     parser.add_argument('--evaluate_individual_rules', type=str2bool, default=False,
                         help='Evaluate and sort individual rules by accuracy')
     parser.add_argument('--rule_confidence_metric', type=str, default='val_accuracy',
-                        choices=['val_accuracy', 'val_f1', 'train_accuracy', 'val_precision'],
-                        help='Metric to use as rule confidence for ranking (MRR/Hits@K)')
+                        choices=['val_accuracy', 'val_f1', 'train_accuracy', 'val_precision', 'nr_nb_ratio'],
+                        help='Metric to use as rule confidence for ranking (MRR/Hits@K). nr_nb_ratio uses N_r/N_b ratio from validation set')
     
     return parser.parse_args()
 
@@ -233,6 +255,16 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
 
+    # Set up logging to save terminal output to file
+    log_file = os.path.join(results_dir, f"training_log_{today_date}_{today_hour}.log")
+    tee = Tee(log_file)
+    sys.stdout = tee
+    sys.stderr = tee
+    
+    print(f"Logging session started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Log file: {log_file}")
+    print("="*70)
+
     # Set device
     if args.force_cpu:
         device = torch.device("cpu")
@@ -297,7 +329,7 @@ def main():
 
         if check_binary_dataset(X_train):
             # perturb data by adding small noise to zero and reducing one to less than one
-            X_train = X_train - 0.1 * torch.rand_like(X_train) * (X_train - 0.5).sign()
+            X_train = X_train - args.pp * torch.rand_like(X_train) * (X_train - 0.5).sign()
             # clip to [0, 1]
             X_train = torch.clamp(X_train, 0.0, 1.0)
 
@@ -336,7 +368,7 @@ def main():
             dataset_type = "binary"
             print("X_train is a binary dataset. We are perturbing the data for a better training.")
             # perturb data by adding small noise to zero and reducing one to less than one
-            X_train = X_train - 0.1 * torch.rand_like(X_train) * (X_train - 0.5).sign()
+            X_train = X_train - args.pp * torch.rand_like(X_train) * (X_train - 0.5).sign()
             # clip to [0, 1]
             X_train = torch.clamp(X_train, 0.0, 1.0)
 
@@ -363,7 +395,14 @@ def main():
                                                 relation_variable_permutations, 
                                                 all_relations)
             body_predicates.append(predicate_name)
-        head_predicate = "blockpositionindex(X1, X2)" #body_predicates[252]  # Example head predicate
+
+        # check if the length of body_predicates matches the number of columns in X_train
+        assert len(body_predicates) == X_train.shape[1], "Mismatch between body predicates and X_train columns."
+        _, variables = create_V_matrix(body_predicates)
+        head_predicate = args.head_predicate
+        head_vars, connected_vars = extract_head_and_connected_vars(head_predicate, variables)
+
+        # head_predicate = "blockpositionindex(X1, X2)" #body_predicates[252]  # Example head predicate
         for idx in range(len(predicate_list)):
             if body_predicates[idx] == head_predicate:
                 headpred_idx = idx
@@ -374,14 +413,11 @@ def main():
         body_predicates.remove(head_predicate)
         print("Number of body predicates:", len(body_predicates))
 
+        # create variable matrix without head predicate
+        variable_matrix, _ = create_V_matrix(body_predicates)
+
         # remove the corresponding column from X_train
         X_train = torch.cat((X_train[:, :headpred_idx], X_train[:, headpred_idx+1:]), dim=1)
-
-        # check if the length of body_predicates matches the number of columns in X_train
-        assert len(body_predicates) == X_train.shape[1], "Mismatch between body predicates and X_train columns."
-        variable_matrix, variables = create_V_matrix(body_predicates)
-        head_predicate = args.head_predicate
-        head_vars, connected_vars = extract_head_and_connected_vars(head_predicate, variables)
 
         input_dim = X_train.shape[1]
         num_samples = X_train.shape[0]
@@ -769,6 +805,42 @@ def main():
 
     print("\n=== Best Model Evaluation on Validation Set ===")
     best_model.print_evaluation(X_val, y_val)
+    
+    # Save best model metrics to JSON
+    best_model.eval()
+    with torch.no_grad():
+        best_train_metrics = best_model.evaluate(X_train, y_train)
+        best_val_metrics = best_model.evaluate(X_val, y_val)
+    
+    best_model_metrics = {
+        'num_rules': best_num_rules,
+        'training': {
+            'accuracy': float(best_train_metrics['accuracy']),
+            'precision': float(best_train_metrics['precision']),
+            'recall': float(best_train_metrics['recall']),
+            'f1_score': float(best_train_metrics['f1_score']),
+            'roc_auc': float(best_train_metrics['roc_auc']),
+            'specificity': float(best_train_metrics['specificity'])
+        },
+        'validation': {
+            'accuracy': float(best_val_metrics['accuracy']),
+            'precision': float(best_val_metrics['precision']),
+            'recall': float(best_val_metrics['recall']),
+            'f1_score': float(best_val_metrics['f1_score']),
+            'roc_auc': float(best_val_metrics['roc_auc']),
+            'specificity': float(best_val_metrics['specificity'])
+        },
+        'best_model_criterion': args.best_model_criterion,
+        'final_train_loss': float(best_losses_train[-1]) if best_losses_train else None,
+        'final_val_loss': float(best_losses_val[-1]) if best_losses_val else None,
+        'min_train_loss': float(min(best_losses_train)) if best_losses_train else None,
+        'min_val_loss': float(min(best_losses_val)) if best_losses_val else None
+    }
+    
+    best_model_metrics_path = os.path.join(results_dir, f"best_model_metrics_{today_date}_{today_hour}.json")
+    with open(best_model_metrics_path, 'w') as f:
+        json.dump(best_model_metrics, f, indent=2)
+    print(f"\nSaved best model metrics to: {best_model_metrics_path}")
 
     # Plot loss curves (both training and validation)
     if visualize_weights:
@@ -936,6 +1008,61 @@ def main():
         )
         unified_model = unified_model.to(device)
         
+        # Evaluate unified model performance
+        print("\n" + "="*70)
+        print("UNIFIED MODEL EVALUATION")
+        print("="*70)
+        
+        unified_model.eval()
+        with torch.no_grad():
+            # Training set evaluation
+            train_metrics = unified_model.evaluate(X_train, y_train)
+            print("\nUnified Model - Training Set Metrics:")
+            print(f"  Accuracy:    {train_metrics['accuracy']:.4f}")
+            print(f"  Precision:   {train_metrics['precision']:.4f}")
+            print(f"  Recall:      {train_metrics['recall']:.4f}")
+            print(f"  F1 Score:    {train_metrics['f1_score']:.4f}")
+            print(f"  ROC-AUC:     {train_metrics['roc_auc']:.4f}")
+            print(f"  Specificity: {train_metrics['specificity']:.4f}")
+            
+            # Validation/Test set evaluation
+            val_metrics = unified_model.evaluate(X_val, y_val)
+            print("\nUnified Model - Validation/Test Set Metrics:")
+            print(f"  Accuracy:    {val_metrics['accuracy']:.4f}")
+            print(f"  Precision:   {val_metrics['precision']:.4f}")
+            print(f"  Recall:      {val_metrics['recall']:.4f}")
+            print(f"  F1 Score:    {val_metrics['f1_score']:.4f}")
+            print(f"  ROC-AUC:     {val_metrics['roc_auc']:.4f}")
+            print(f"  Specificity: {val_metrics['specificity']:.4f}")
+            
+            # Save unified model metrics
+            unified_metrics = {
+                'training': {
+                    'accuracy': float(train_metrics['accuracy']),
+                    'precision': float(train_metrics['precision']),
+                    'recall': float(train_metrics['recall']),
+                    'f1_score': float(train_metrics['f1_score']),
+                    'roc_auc': float(train_metrics['roc_auc']),
+                    'specificity': float(train_metrics['specificity'])
+                },
+                'validation': {
+                    'accuracy': float(val_metrics['accuracy']),
+                    'precision': float(val_metrics['precision']),
+                    'recall': float(val_metrics['recall']),
+                    'f1_score': float(val_metrics['f1_score']),
+                    'roc_auc': float(val_metrics['roc_auc']),
+                    'specificity': float(val_metrics['specificity'])
+                },
+                'num_rules': len(rules_to_use)
+            }
+            
+            unified_metrics_path = os.path.join(save_dir_rules, "unified_model_metrics.json")
+            with open(unified_metrics_path, 'w') as f:
+                json.dump(unified_metrics, f, indent=2)
+            print(f"\nSaved unified model metrics to: {unified_metrics_path}")
+        
+        print("="*70)
+        
         # Export the sorted rule weights
         pt_path, json_path = unified_model.export_rule_weights(save_dir_rules, file_prefix="sorted_rules")
         
@@ -1008,17 +1135,119 @@ def main():
             print(f"      Val Coverage: (N_b={N_b_val}, N_r={N_r_val}, N_r/N_b={ratio_val:.4f})")
             print(f"      Train Coverage: (N_b={N_b_train}, N_r={N_r_train}, N_r/N_b={ratio_train:.4f})")
         
-        # Extract rule confidences based on selected metric
-        confidence_metric_map = {
-            'val_accuracy': 'eval_accuracy',
-            'val_f1': 'eval_f1',
-            'train_accuracy': 'training_accuracy',
-            'val_precision': 'eval_precision'
-        }
-        confidence_key = confidence_metric_map[args.rule_confidence_metric]
-        rule_confidences = np.array([rule[confidence_key] for rule in rules_metadata])
+        # If using nr_nb_ratio metric, re-sort rules based on N_r/N_b ratio
+        if args.rule_confidence_metric == 'nr_nb_ratio':
+            print("\n" + "="*70)
+            print("RE-SORTING RULES BY N_r/N_b RATIO (Validation Set)")
+            print("="*70)
+            
+            # Create list of (rule_info, coverage_stats) tuples
+            rules_with_stats = list(zip(rules_to_use, rule_coverage_stats_val, rule_coverage_stats_train))
+            
+            # Sort by N_r/N_b ratio (descending)
+            rules_with_stats.sort(key=lambda x: x[1][2], reverse=True)
+            
+            # Unpack back to separate lists
+            rules_to_use = [item[0] for item in rules_with_stats]
+            rule_coverage_stats_val = [item[1] for item in rules_with_stats]
+            rule_coverage_stats_train = [item[2] for item in rules_with_stats]
+            
+            # Rebuild the unified model with re-sorted rules
+            sorted_rule_weights = [rule_info['weights'] for rule_info in rules_to_use]
+            unified_model = ANDRE.build_from_rule_weights(
+                sorted_rule_weights,
+                pot_body_pred_dim=input_dim,
+                variable_matrix=variable_matrix if structured_data else None
+            )
+            unified_model = unified_model.to(device)
+            
+            # Re-evaluate unified model with new ordering
+            print("\nRe-evaluating unified model with N_r/N_b sorted rules...")
+            unified_model.eval()
+            with torch.no_grad():
+                train_metrics = unified_model.evaluate(X_train, y_train)
+                val_metrics = unified_model.evaluate(X_val, y_val)
+                
+                print(f"  Training Accuracy: {train_metrics['accuracy']:.4f}")
+                print(f"  Validation Accuracy: {val_metrics['accuracy']:.4f}")
+            
+            # Re-compute scores with new rule ordering
+            with torch.no_grad():
+                rule_scores_train = unified_model.get_rule_scores(X_train, apply_attention=False)
+                scores_train_np = rule_scores_train.cpu().numpy().T
+                
+                rule_scores_val = unified_model.get_rule_scores(X_val, apply_attention=False)
+                scores_val_np = rule_scores_val.cpu().numpy().T
+                
+                adjusted_scores_train = scores_train_np * y_train_np + (1 - scores_train_np) * (1 - y_train_np)
+                adjusted_scores_val = scores_val_np * y_val_np + (1 - scores_val_np) * (1 - y_val_np)
+            
+            # Update metadata ranks
+            rules_metadata = []
+            for rank, rule_info in enumerate(rules_to_use, 1):
+                metadata_entry = {k: v for k, v in rule_info.items() if k != 'weights'}
+                metadata_entry['rank'] = rank
+                rules_metadata.append(metadata_entry)
+            
+            # Update saved files with re-sorted data
+            with open(metadata_path, 'w') as f:
+                json.dump(rules_metadata, f, indent=2)
+            
+            df_train = pd.DataFrame(adjusted_scores_train,
+                                   columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+            df_train['label'] = y_train.cpu().numpy()
+            df_train.to_csv(os.path.join(save_dir_rules, "train_sorted_rule_scores.csv"), index=False)
+            
+            df_val = pd.DataFrame(adjusted_scores_val,
+                                 columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+            df_val['label'] = y_val.cpu().numpy()
+            df_val.to_csv(os.path.join(save_dir_rules, "val_sorted_rule_scores.csv"), index=False)
+            
+            # Re-export weights
+            pt_path, json_path = unified_model.export_rule_weights(save_dir_rules, file_prefix="sorted_rules")
+            
+            # Update unified model metrics
+            unified_metrics = {
+                'training': {
+                    'accuracy': float(train_metrics['accuracy']),
+                    'precision': float(train_metrics['precision']),
+                    'recall': float(train_metrics['recall']),
+                    'f1_score': float(train_metrics['f1_score']),
+                    'roc_auc': float(train_metrics['roc_auc']),
+                    'specificity': float(train_metrics['specificity'])
+                },
+                'validation': {
+                    'accuracy': float(val_metrics['accuracy']),
+                    'precision': float(val_metrics['precision']),
+                    'recall': float(val_metrics['recall']),
+                    'f1_score': float(val_metrics['f1_score']),
+                    'roc_auc': float(val_metrics['roc_auc']),
+                    'specificity': float(val_metrics['specificity'])
+                },
+                'num_rules': len(rules_to_use)
+            }
+            with open(unified_metrics_path, 'w') as f:
+                json.dump(unified_metrics, f, indent=2)
+            
+            print(f"\nRules re-sorted and files updated based on N_r/N_b ratio!")
+            print("="*70)
         
-        print(f"\nUsing '{args.rule_confidence_metric}' as rule confidence metric")
+        # Extract rule confidences based on selected metric
+        if args.rule_confidence_metric == 'nr_nb_ratio':
+            # Use N_r/N_b ratio from validation set coverage statistics
+            rule_confidences = np.array([stats[2] for stats in rule_coverage_stats_val])
+            print(f"\nUsing 'nr_nb_ratio' (N_r/N_b from validation set) as rule confidence metric")
+        else:
+            confidence_metric_map = {
+                'val_accuracy': 'eval_accuracy',
+                'val_f1': 'eval_f1',
+                'train_accuracy': 'training_accuracy',
+                'val_precision': 'eval_precision'
+            }
+            confidence_key = confidence_metric_map[args.rule_confidence_metric]
+            rule_confidences = np.array([rule[confidence_key] for rule in rules_metadata])
+            print(f"\nUsing '{args.rule_confidence_metric}' as rule confidence metric")
+        
         print(f"Rule confidences: {rule_confidences}")
         
         # Training set metrics
@@ -1057,17 +1286,69 @@ def main():
         print(f"  - train_sorted_rule_scores.csv")
         print(f"  - val_sorted_rule_scores.csv")
         print(f"  - {ranking_metrics_path}")
+        
+        # Final Summary: Compare Best Model vs Unified Model
+        print("\n" + "="*70)
+        print("FINAL SUMMARY - MODEL COMPARISON ON TEST/VALIDATION SET")
+        print("="*70)
+        
+        # Load best model metrics (already computed and saved earlier)
+        with open(best_model_metrics_path, 'r') as f:
+            best_model_metrics_loaded = json.load(f)
+        
+        print(f"\nBest Model (from training) - {best_num_rules} rules:")
+        print(f"  Accuracy:    {best_model_metrics_loaded['validation']['accuracy']:.4f}")
+        print(f"  Precision:   {best_model_metrics_loaded['validation']['precision']:.4f}")
+        print(f"  Recall:      {best_model_metrics_loaded['validation']['recall']:.4f}")
+        print(f"  F1 Score:    {best_model_metrics_loaded['validation']['f1_score']:.4f}")
+        print(f"  ROC-AUC:     {best_model_metrics_loaded['validation']['roc_auc']:.4f}")
+        
+        # Get unified model metrics (already computed earlier)
+        with open(unified_metrics_path, 'r') as f:
+            unified_metrics_loaded = json.load(f)
+        
+        print(f"\nUnified Model (sorted valid rules) - {len(rules_to_use)} rules:")
+        print(f"  Accuracy:    {unified_metrics_loaded['validation']['accuracy']:.4f}")
+        print(f"  Precision:   {unified_metrics_loaded['validation']['precision']:.4f}")
+        print(f"  Recall:      {unified_metrics_loaded['validation']['recall']:.4f}")
+        print(f"  F1 Score:    {unified_metrics_loaded['validation']['f1_score']:.4f}")
+        print(f"  ROC-AUC:     {unified_metrics_loaded['validation']['roc_auc']:.4f}")
+        
+        # Compute performance differences
+        acc_diff = unified_metrics_loaded['validation']['accuracy'] - best_model_metrics_loaded['validation']['accuracy']
+        f1_diff = unified_metrics_loaded['validation']['f1_score'] - best_model_metrics_loaded['validation']['f1_score']
+        
+        print(f"\nPerformance Difference (Unified - Best):")
+        print(f"  Accuracy Δ:  {acc_diff:+.4f}")
+        print(f"  F1 Score Δ:  {f1_diff:+.4f}")
+        
+        print("="*70)
+    
+    # End logging session
+    print("\n" + "="*70)
+    print(f"Logging session ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"All output saved to: {log_file}")
+    print("="*70)
     
     # Return the list for programmatic access
     return all_discovered_rules, results_dir
 
 
 if __name__ == '__main__':
-    all_rules, results_dir = main()
+    try:
+        all_rules, results_dir = main()
+        
+        # Optional: Save to file
+        if all_rules:
+            discovered_rules_path = os.path.join(results_dir, 'discovered_rules.json')
+            with open(discovered_rules_path, 'w') as f:
+                json.dump(all_rules, f, indent=2)
+            print(f"\nSaved {len(all_rules)} discovered rules to '{discovered_rules_path}'")
     
-    # Optional: Save to file
-    if all_rules:
-        discovered_rules_path = os.path.join(results_dir, 'discovered_rules.json')
-        with open(discovered_rules_path, 'w') as f:
-            json.dump(all_rules, f, indent=2)
-        print(f"\nSaved {len(all_rules)} discovered rules to '{discovered_rules_path}'")
+    finally:
+        # Restore stdout and stderr, close log file
+        if hasattr(sys.stdout, 'close') and hasattr(sys.stdout, 'terminal'):
+            terminal = sys.stdout.terminal
+            sys.stdout.close()
+            sys.stdout = terminal
+            sys.stderr = terminal
