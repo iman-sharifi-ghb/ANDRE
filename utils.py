@@ -510,7 +510,8 @@ def compute_mrr(scores, labels, rule_confidences):
         for r, rule_idx in enumerate(ranked_rule_indices, start=1):
             # Check if this rule correctly predicts the sample
             prediction = sample_scores[rule_idx]
-            is_correct = (prediction > 0.5 and label == 1) or (prediction <= 0.5 and label == 0)
+            # is_correct = (prediction > 0.5 and label == 1) or (prediction <= 0.5 and label == 0)
+            is_correct = (prediction >= 0.5) == (label == 1)
             
             if is_correct:
                 rank = r
@@ -724,14 +725,14 @@ def validate_rule_by_text(rule_text, head_vars, connected_vars):
     # (which means at least twice total: once in head, once in body)
     for head_var in head_vars:
         body_count = body_var_counts.get(head_var, 0)
-        if body_count != 1:
+        if body_count < 1:
             return False, f"Head variable X{head_var+1} appears {body_count} times in body (need ≥1)"
     
     # Check constraint 2: Connected variables must appear at least twice
     for conn_var in connected_vars:
         total_count = total_var_counts.get(conn_var, 0)
         if total_count == 1:
-            return False, f"Connected variable X{conn_var+1} appears {total_count} times (need ≥2)"
+            return False, f"Connected variable X{conn_var+1} appears {total_count} times (need != 1)"
     
     return True, "Valid"
 
