@@ -26,41 +26,13 @@ from utils import parse_rule_and_generate_data
 from utils import compute_ranking_metrics, print_ranking_metrics
 from utils import filter_valid_rules
 from utils import extract_head_and_connected_vars
+from utils import top_k_cosine_similar, mean_reciprocal_rank, hits_at_k, compute_mrr_hits
+from utils import schedule_loss_weights
+from utils import str2bool, Tee
+from utils import get_predicate_name, evaluate_single_rule
 import numpy as np
 import pandas as pd
 from datetime import datetime
-
-
-class Tee:
-    """Duplicate output to both console and log file."""
-    def __init__(self, log_file):
-        self.terminal = sys.stdout
-        self.log = open(log_file, 'a')
-    
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()  # Ensure immediate write to file
-    
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
-    
-    def close(self):
-        self.log.close()
-
-
-def str2bool(v):
-    """Convert string to boolean for argparse."""
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
-
 
 def parse_args():
     """Parse command line arguments."""
@@ -148,95 +120,6 @@ def parse_args():
                         help='Metric to use as rule confidence for ranking (MRR/Hits@K). nr_nb_ratio uses N_r/N_b ratio from validation set')
     
     return parser.parse_args()
-
-
-def schedule_loss_weights(epoch, total_epochs, 
-                        initial_ent_weight=0.0, final_ent_weight=0.1, 
-                        initial_rr_weight=0.0, final_rr_weight=1.0, 
-                        initial_conn_weight=0.0, final_conn_weight=3.0, 
-                        initial_digit_weight=0.0, final_digit_weight=0.05, 
-                        initial_sim_weight=1.0, final_sim_weight=0.1):
-    
-    """Schedule weights for range restriction, connectivity, and digitization losses."""
-    # Linearly increase rr_weight and conn_weight from 0 to their initial values over the epochs
-    ent_weight = initial_ent_weight + (epoch / total_epochs) * (final_ent_weight - initial_ent_weight)
-    rr_weight = initial_rr_weight + (epoch / total_epochs)**2 * (final_rr_weight - initial_rr_weight)
-    conn_weight = initial_conn_weight + (epoch / total_epochs)**2 * (final_conn_weight - initial_conn_weight)
-    digit_weight = initial_digit_weight + (epoch / total_epochs)**2 * (final_digit_weight - initial_digit_weight)
-    sim_weight = initial_sim_weight + (epoch / total_epochs)**2 * (final_sim_weight - initial_sim_weight)
-
-    ent_weight = min(ent_weight, final_ent_weight)
-    rr_weight = min(rr_weight, final_rr_weight)
-    conn_weight = min(conn_weight, final_conn_weight)
-    digit_weight = min(digit_weight, final_digit_weight)
-    sim_weight = min(sim_weight, final_sim_weight)
-    
-    return ent_weight, rr_weight, conn_weight, digit_weight, sim_weight
-
-
-def get_predicate_name(index, predicate_list, relation_variable_permutations, all_relations):
-    """
-    Convert a feature index in X_train to its symbolic predicate name.
-    """
-    # Get variable mapping (e.g., (0, 1) for X, Y)
-    var_tuple = predicate_list[index]
-    
-    # Variable name mapping
-    var_names = {0: 'X1', 1: 'X2', 2: 'X3', 3: 'X4', 4: 'X5', 5: 'X6'}
-    
-    # Find which relation this belongs to
-    cumulative_index = 0
-    for relation_name, permutations in relation_variable_permutations.items():
-        if cumulative_index <= index < cumulative_index + len(permutations):
-            # Found the relation
-            local_index = index - cumulative_index
-            var_pair = permutations[local_index]
-            
-            # Build symbolic predicate
-            symbolic = f"{relation_name}({var_names[var_pair[0]]}, {var_names[var_pair[1]]})"
-            return symbolic
-        
-        cumulative_index += len(permutations)
-    
-    return "Unknown"
-
-
-def evaluate_single_rule(rule_weights, X_data, y_data, variable_matrix, device):
-    """
-    Create a single-rule ANDRE model and evaluate its accuracy.
-    
-    Args:
-        rule_weights: List of weights for all neurons in the rule
-        X_data: Input features
-        y_data: True labels
-        variable_matrix: Variable matrix for structured data
-        device: Device to use for computation
-        
-    Returns:
-        Dictionary with accuracy and other metrics
-    """
-    # Find x_data columns as input_dim
-    input_dim = X_data.shape[1]
-
-    # Create single-rule ANDRE model
-    single_rule_model = ANDRE(num_rules=1, pot_body_pred_dim=input_dim, 
-                              variable_matrix=variable_matrix, lr=0.005, weight_decay=1e-4)
-    single_rule_model = single_rule_model.to(device)
-    
-    # Load the weights for this single rule
-    # In ANDRE_Net2, the structure is: rules[0] is a RuleBlock, which contains activation (ProbSumActivation)
-    # The raw_weights are in the activation layer
-    with torch.no_grad():
-        # Stack all neuron weights into a single tensor [input_dim, 3]
-        weights_array = torch.tensor(rule_weights, dtype=torch.float32, device=device)  # [input_dim, 3]
-        # Use log to approximate inverse softmax
-        single_rule_model.rules[0].activation.raw_weights.data = torch.log(weights_array + 1e-10)
-    
-    # Evaluate the single rule
-    single_rule_model.eval()
-    metrics = single_rule_model.evaluate(X_data, y_data)
-    
-    return metrics
 
 
 def main():
@@ -800,7 +683,9 @@ def main():
     best_model = best_model.to(device)
 
     # Evaluate best model
+
     print("\n=== Best Model Training Evaluation ===")
+
     best_model.print_evaluation(X_train, y_train)
 
     print("\n=== Best Model Evaluation on Validation Set ===")
@@ -841,6 +726,19 @@ def main():
     with open(best_model_metrics_path, 'w') as f:
         json.dump(best_model_metrics, f, indent=2)
     print(f"\nSaved best model metrics to: {best_model_metrics_path}")
+
+    # Compute MRR and Hits@K using corrupted validation set
+    print("\n=== Computing MRR and Hits@K on Validation Set for Best Model ===")
+    # Split validation set into positive and negative samples
+    X_val_pos = X_val[y_val == 1]
+    X_val_neg = X_val[y_val == 0]
+    print(f"Positive validation samples: {X_val_pos.shape[0]}")
+    print(f"Negative validation samples: {X_val_neg.shape[0]}")
+    mrr, hits = compute_mrr_hits(X_val, y_val, best_model, k=100)
+    print(f"Mean Reciprocal Rank (MRR): {mrr:.4f}")
+
+    for k in [1, 3, 5, 10]:
+        print(f"Hits@{k}: {hits[k]:.4f}")
 
     # Plot loss curves (both training and validation)
     if visualize_weights:
@@ -1079,87 +977,87 @@ def main():
             json.dump(rules_metadata, f, indent=2)
         
         # Compute and save per-sample scores for the unified sorted model
-        print("\nComputing per-sample scores for sorted rules...")
-        with torch.no_grad():
-            rule_scores_train = unified_model.get_rule_scores(X_train, apply_attention=False)
-            scores_train_np = rule_scores_train.cpu().numpy().T  # [B, R]
+        # print("\nComputing per-sample scores for sorted rules...")
+        # with torch.no_grad():
+        #     rule_scores_train = unified_model.get_rule_scores(X_train, apply_attention=False)
+        #     scores_train_np = rule_scores_train.cpu().numpy().T  # [B, R]
             
-            rule_scores_val = unified_model.get_rule_scores(X_val, apply_attention=False)
-            scores_val_np = rule_scores_val.cpu().numpy().T  # [B, R]
+        #     rule_scores_val = unified_model.get_rule_scores(X_val, apply_attention=False)
+        #     scores_val_np = rule_scores_val.cpu().numpy().T  # [B, R]
             
-            # Adjust scores based on labels: score * y + (1 - score) * (1 - y)
-            y_train_np = y_train.cpu().numpy().reshape(-1, 1)  # [B, 1]
-            y_val_np = y_val.cpu().numpy().reshape(-1, 1)  # [B, 1]
+        #     # Adjust scores based on labels: score * y + (1 - score) * (1 - y)
+        #     y_train_np = y_train.cpu().numpy().reshape(-1, 1)  # [B, 1]
+        #     y_val_np = y_val.cpu().numpy().reshape(-1, 1)  # [B, 1]
             
-            adjusted_scores_train = scores_train_np * y_train_np + (1 - scores_train_np) * (1 - y_train_np)
-            adjusted_scores_val = scores_val_np * y_val_np + (1 - scores_val_np) * (1 - y_val_np)
+        #     adjusted_scores_train = scores_train_np * y_train_np + (1 - scores_train_np) * (1 - y_train_np)
+        #     adjusted_scores_val = scores_val_np * y_val_np + (1 - scores_val_np) * (1 - y_val_np)
             
-            df_train = pd.DataFrame(adjusted_scores_train,
-                                   columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
-            df_train['label'] = y_train.cpu().numpy()
-            df_train.to_csv(os.path.join(save_dir_rules, "train_sorted_rule_scores.csv"), index=False)
+        #     df_train = pd.DataFrame(adjusted_scores_train,
+        #                            columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+        #     df_train['label'] = y_train.cpu().numpy()
+        #     df_train.to_csv(os.path.join(save_dir_rules, "train_sorted_rule_scores.csv"), index=False)
             
-            df_val = pd.DataFrame(adjusted_scores_val,
-                                 columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
-            df_val['label'] = y_val.cpu().numpy()
-            df_val.to_csv(os.path.join(save_dir_rules, "val_sorted_rule_scores.csv"), index=False)
+        #     df_val = pd.DataFrame(adjusted_scores_val,
+        #                          columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+        #     df_val['label'] = y_val.cpu().numpy()
+        #     df_val.to_csv(os.path.join(save_dir_rules, "val_sorted_rule_scores.csv"), index=False)
         
         # Compute ranking metrics (MRR and Hits@K)
-        print("\n" + "="*70)
-        print("Computing ranking metrics...")
+        # print("\n" + "="*70)
+        # print("Computing ranking metrics...")
         
-        # Print valid rules being used
-        print(f"\nValid rules used for unified model ({len(rules_to_use)} rules):")
+        # # Print valid rules being used
+        # print(f"\nValid rules used for unified model ({len(rules_to_use)} rules):")
         
-        # Compute coverage statistics for each rule
-        rule_coverage_stats_val = []
-        rule_coverage_stats_train = []
+        # # Compute coverage statistics for each rule
+        # rule_coverage_stats_val = []
+        # rule_coverage_stats_train = []
         
-        for idx, rule_info in enumerate(rules_to_use, 1):
-            # Validation set statistics
-            rule_predictions_val = scores_val_np[:, idx-1] > 0.5  # Rule predicts true
-            N_b_val = np.sum(rule_predictions_val)
-            N_r_val = np.sum(rule_predictions_val & (y_val_np.flatten() == 1))
-            ratio_val = N_r_val / N_b_val if N_b_val > 0 else 0.0
-            rule_coverage_stats_val.append((int(N_b_val), int(N_r_val), float(ratio_val)))
+        # for idx, rule_info in enumerate(rules_to_use, 1):
+        #     # Validation set statistics
+        #     rule_predictions_val = scores_val_np[:, idx-1] > 0.5  # Rule predicts true
+        #     N_b_val = np.sum(rule_predictions_val)
+        #     N_r_val = np.sum(rule_predictions_val & (y_val_np.flatten() == 1))
+        #     ratio_val = N_r_val / N_b_val if N_b_val > 0 else 0.0
+        #     rule_coverage_stats_val.append((int(N_b_val), int(N_r_val), float(ratio_val)))
             
-            # Training set statistics
-            rule_predictions_train = scores_train_np[:, idx-1] > 0.5  # Rule predicts true
-            N_b_train = np.sum(rule_predictions_train)
-            N_r_train = np.sum(rule_predictions_train & (y_train_np.flatten() == 1))
-            ratio_train = N_r_train / N_b_train if N_b_train > 0 else 0.0
-            rule_coverage_stats_train.append((int(N_b_train), int(N_r_train), float(ratio_train)))
+        #     # Training set statistics
+        #     rule_predictions_train = scores_train_np[:, idx-1] > 0.5  # Rule predicts true
+        #     N_b_train = np.sum(rule_predictions_train)
+        #     N_r_train = np.sum(rule_predictions_train & (y_train_np.flatten() == 1))
+        #     ratio_train = N_r_train / N_b_train if N_b_train > 0 else 0.0
+        #     rule_coverage_stats_train.append((int(N_b_train), int(N_r_train), float(ratio_train)))
             
-            print(f"  [{idx}] {rule_info['rule']}")
-            print(f"      Training Acc: {rule_info['training_accuracy']:.4f} | Eval Acc: {rule_info['eval_accuracy']:.4f}")
-            print(f"      Val Coverage: (N_b={N_b_val}, N_r={N_r_val}, N_r/N_b={ratio_val:.4f})")
-            print(f"      Train Coverage: (N_b={N_b_train}, N_r={N_r_train}, N_r/N_b={ratio_train:.4f})")
+        #     print(f"  [{idx}] {rule_info['rule']}")
+        #     print(f"      Training Acc: {rule_info['training_accuracy']:.4f} | Eval Acc: {rule_info['eval_accuracy']:.4f}")
+        #     print(f"      Val Coverage: (N_b={N_b_val}, N_r={N_r_val}, N_r/N_b={ratio_val:.4f})")
+        #     print(f"      Train Coverage: (N_b={N_b_train}, N_r={N_r_train}, N_r/N_b={ratio_train:.4f})")
         
         # If using nr_nb_ratio metric, re-sort rules based on N_r/N_b ratio
-        if args.rule_confidence_metric == 'nr_nb_ratio':
-            print("\n" + "="*70)
-            print("RE-SORTING RULES BY N_r/N_b RATIO (Validation Set)")
-            print("="*70)
+        # if args.rule_confidence_metric == 'nr_nb_ratio':
+        #     print("\n" + "="*70)
+        #     print("RE-SORTING RULES BY N_r/N_b RATIO (Validation Set)")
+        #     print("="*70)
             
-            # Create list of (rule_info, coverage_stats) tuples
-            rules_with_stats = list(zip(rules_to_use, rule_coverage_stats_val, rule_coverage_stats_train))
+        #     # Create list of (rule_info, coverage_stats) tuples
+        #     rules_with_stats = list(zip(rules_to_use, rule_coverage_stats_val, rule_coverage_stats_train))
             
-            # Sort by N_r/N_b ratio (descending)
-            rules_with_stats.sort(key=lambda x: x[1][2], reverse=True)
+        #     # Sort by N_r/N_b ratio (descending)
+        #     rules_with_stats.sort(key=lambda x: x[1][2], reverse=True)
             
-            # Unpack back to separate lists
-            rules_to_use = [item[0] for item in rules_with_stats]
-            rule_coverage_stats_val = [item[1] for item in rules_with_stats]
-            rule_coverage_stats_train = [item[2] for item in rules_with_stats]
+        #     # Unpack back to separate lists
+        #     rules_to_use = [item[0] for item in rules_with_stats]
+        #     rule_coverage_stats_val = [item[1] for item in rules_with_stats]
+        #     rule_coverage_stats_train = [item[2] for item in rules_with_stats]
             
-            # Rebuild the unified model with re-sorted rules
-            sorted_rule_weights = [rule_info['weights'] for rule_info in rules_to_use]
-            unified_model = ANDRE.build_from_rule_weights(
-                sorted_rule_weights,
-                pot_body_pred_dim=input_dim,
-                variable_matrix=variable_matrix if structured_data else None
-            )
-            unified_model = unified_model.to(device)
+        #     # Rebuild the unified model with re-sorted rules
+        #     sorted_rule_weights = [rule_info['weights'] for rule_info in rules_to_use]
+        #     unified_model = ANDRE.build_from_rule_weights(
+        #         sorted_rule_weights,
+        #         pot_body_pred_dim=input_dim,
+        #         variable_matrix=variable_matrix if structured_data else None
+        #     )
+        #     unified_model = unified_model.to(device)
             
             # Re-evaluate unified model with new ordering
             print("\nRe-evaluating unified model with N_r/N_b sorted rules...")
@@ -1170,41 +1068,46 @@ def main():
                 
                 print(f"  Training Accuracy: {train_metrics['accuracy']:.4f}")
                 print(f"  Validation Accuracy: {val_metrics['accuracy']:.4f}")
+
+                mrr, hits = compute_mrr_hits(X_val, y_val, unified_model, k=100)
+                print(f"Mean Reciprocal Rank (MRR): {mrr:.4f}")
+                for k in [1, 3, 5, 10]:
+                    print(f"Hits@{k}: {hits[k]:.4f}")
             
-            # Re-compute scores with new rule ordering
-            with torch.no_grad():
-                rule_scores_train = unified_model.get_rule_scores(X_train, apply_attention=False)
-                scores_train_np = rule_scores_train.cpu().numpy().T
+            # # Re-compute scores with new rule ordering
+            # with torch.no_grad():
+            #     rule_scores_train = unified_model.get_rule_scores(X_train, apply_attention=False)
+            #     scores_train_np = rule_scores_train.cpu().numpy().T
                 
-                rule_scores_val = unified_model.get_rule_scores(X_val, apply_attention=False)
-                scores_val_np = rule_scores_val.cpu().numpy().T
+            #     rule_scores_val = unified_model.get_rule_scores(X_val, apply_attention=False)
+            #     scores_val_np = rule_scores_val.cpu().numpy().T
                 
-                adjusted_scores_train = scores_train_np * y_train_np + (1 - scores_train_np) * (1 - y_train_np)
-                adjusted_scores_val = scores_val_np * y_val_np + (1 - scores_val_np) * (1 - y_val_np)
+            #     adjusted_scores_train = scores_train_np * y_train_np + (1 - scores_train_np) * (1 - y_train_np)
+            #     adjusted_scores_val = scores_val_np * y_val_np + (1 - scores_val_np) * (1 - y_val_np)
             
-            # Update metadata ranks
-            rules_metadata = []
-            for rank, rule_info in enumerate(rules_to_use, 1):
-                metadata_entry = {k: v for k, v in rule_info.items() if k != 'weights'}
-                metadata_entry['rank'] = rank
-                rules_metadata.append(metadata_entry)
+            # # Update metadata ranks
+            # rules_metadata = []
+            # for rank, rule_info in enumerate(rules_to_use, 1):
+            #     metadata_entry = {k: v for k, v in rule_info.items() if k != 'weights'}
+            #     metadata_entry['rank'] = rank
+            #     rules_metadata.append(metadata_entry)
             
-            # Update saved files with re-sorted data
-            with open(metadata_path, 'w') as f:
-                json.dump(rules_metadata, f, indent=2)
+            # # Update saved files with re-sorted data
+            # with open(metadata_path, 'w') as f:
+            #     json.dump(rules_metadata, f, indent=2)
             
-            df_train = pd.DataFrame(adjusted_scores_train,
-                                   columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
-            df_train['label'] = y_train.cpu().numpy()
-            df_train.to_csv(os.path.join(save_dir_rules, "train_sorted_rule_scores.csv"), index=False)
+            # df_train = pd.DataFrame(adjusted_scores_train,
+            #                        columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+            # df_train['label'] = y_train.cpu().numpy()
+            # df_train.to_csv(os.path.join(save_dir_rules, "train_sorted_rule_scores.csv"), index=False)
             
-            df_val = pd.DataFrame(adjusted_scores_val,
-                                 columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
-            df_val['label'] = y_val.cpu().numpy()
-            df_val.to_csv(os.path.join(save_dir_rules, "val_sorted_rule_scores.csv"), index=False)
+            # df_val = pd.DataFrame(adjusted_scores_val,
+            #                      columns=[f"rule_rank_{i+1}_score" for i in range(len(rules_to_use))])
+            # df_val['label'] = y_val.cpu().numpy()
+            # df_val.to_csv(os.path.join(save_dir_rules, "val_sorted_rule_scores.csv"), index=False)
             
-            # Re-export weights
-            pt_path, json_path = unified_model.export_rule_weights(save_dir_rules, file_prefix="sorted_rules")
+            # # Re-export weights
+            # pt_path, json_path = unified_model.export_rule_weights(save_dir_rules, file_prefix="sorted_rules")
             
             # Update unified model metrics
             unified_metrics = {
@@ -1233,59 +1136,59 @@ def main():
             print("="*70)
         
         # Extract rule confidences based on selected metric
-        if args.rule_confidence_metric == 'nr_nb_ratio':
-            # Use N_r/N_b ratio from validation set coverage statistics
-            rule_confidences = np.array([stats[2] for stats in rule_coverage_stats_val])
-            print(f"\nUsing 'nr_nb_ratio' (N_r/N_b from validation set) as rule confidence metric")
-        else:
-            confidence_metric_map = {
-                'val_accuracy': 'eval_accuracy',
-                'val_f1': 'eval_f1',
-                'train_accuracy': 'training_accuracy',
-                'val_precision': 'eval_precision'
-            }
-            confidence_key = confidence_metric_map[args.rule_confidence_metric]
-            rule_confidences = np.array([rule[confidence_key] for rule in rules_metadata])
-            print(f"\nUsing '{args.rule_confidence_metric}' as rule confidence metric")
+        # if args.rule_confidence_metric == 'nr_nb_ratio':
+        #     # Use N_r/N_b ratio from validation set coverage statistics
+        #     rule_confidences = np.array([stats[2] for stats in rule_coverage_stats_val])
+        #     print(f"\nUsing 'nr_nb_ratio' (N_r/N_b from validation set) as rule confidence metric")
+        # else:
+        confidence_metric_map = {
+            'val_accuracy': 'eval_accuracy',
+            'val_f1': 'eval_f1',
+            'train_accuracy': 'training_accuracy',
+            'val_precision': 'eval_precision'
+        }
+        confidence_key = confidence_metric_map[args.rule_confidence_metric]
+        rule_confidences = np.array([rule[confidence_key] for rule in rules_metadata])
+        print(f"\nUsing '{args.rule_confidence_metric}' as rule confidence metric")
         
         print(f"Rule confidences: {rule_confidences}")
         
         # Training set metrics
-        train_metrics = compute_ranking_metrics(adjusted_scores_train, y_train.cpu().numpy(), 
-                                                rule_confidences, k_values=[1, 3, 5, 10])
-        print_ranking_metrics(train_metrics, dataset_name="Training Set")
+        # train_metrics = compute_ranking_metrics(adjusted_scores_train, y_train.cpu().numpy(), 
+        #                                         rule_confidences, k_values=[1, 3, 5, 10])
+        # print_ranking_metrics(train_metrics, dataset_name="Training Set")
         
-        # Validation set metrics
-        val_metrics = compute_ranking_metrics(adjusted_scores_val, y_val.cpu().numpy(),
-                                              rule_confidences, k_values=[1, 3, 5, 10])
-        print_ranking_metrics(val_metrics, dataset_name="Validation Set")
+        # # Validation set metrics
+        # val_metrics = compute_ranking_metrics(adjusted_scores_val, y_val.cpu().numpy(),
+        #                                       rule_confidences, k_values=[1, 3, 5, 10])
+        # print_ranking_metrics(val_metrics, dataset_name="Validation Set")
         
-        # Save ranking metrics to JSON
-        ranking_metrics_path = os.path.join(save_dir_rules, "ranking_metrics.json")
-        ranking_results = {
-            'confidence_metric': args.rule_confidence_metric,
-            'rule_confidences': rule_confidences.tolist(),
-            'rule_coverage_stats_validation': rule_coverage_stats_val,
-            'rule_coverage_stats_training': rule_coverage_stats_train,
-            'training': {
-                'mrr': float(train_metrics['mrr']),
-                'hits_at_k': {int(k): float(v) for k, v in train_metrics['hits_at_k'].items()}
-            },
-            'validation': {
-                'mrr': float(val_metrics['mrr']),
-                'hits_at_k': {int(k): float(v) for k, v in val_metrics['hits_at_k'].items()}
-            }
-        }
-        with open(ranking_metrics_path, 'w') as f:
-            json.dump(ranking_results, f, indent=2)
+        # # Save ranking metrics to JSON
+        # ranking_metrics_path = os.path.join(save_dir_rules, "ranking_metrics.json")
+        # ranking_results = {
+        #     'confidence_metric': args.rule_confidence_metric,
+        #     'rule_confidences': rule_confidences.tolist(),
+        #     'rule_coverage_stats_validation': rule_coverage_stats_val,
+        #     'rule_coverage_stats_training': rule_coverage_stats_train,
+        #     # 'training': {
+        #     #     'mrr': float(train_metrics['mrr']),
+        #     #     'hits_at_k': {int(k): float(v) for k, v in train_metrics['hits_at_k'].items()}
+        #     # },
+        #     # 'validation': {
+        #     #     'mrr': float(val_metrics['mrr']),
+        #     #     'hits_at_k': {int(k): float(v) for k, v in val_metrics['hits_at_k'].items()}
+        #     # }
+        # }
+        # with open(ranking_metrics_path, 'w') as f:
+        #     json.dump(ranking_results, f, indent=2)
         
-        print(f"\nSaved sorted rule weights and scores to: {save_dir_rules}")
-        print(f"  - {pt_path}")
-        print(f"  - {json_path}")
-        print(f"  - {metadata_path}")
-        print(f"  - train_sorted_rule_scores.csv")
-        print(f"  - val_sorted_rule_scores.csv")
-        print(f"  - {ranking_metrics_path}")
+        # print(f"\nSaved sorted rule weights and scores to: {save_dir_rules}")
+        # print(f"  - {pt_path}")
+        # print(f"  - {json_path}")
+        # print(f"  - {metadata_path}")
+        # print(f"  - train_sorted_rule_scores.csv")
+        # print(f"  - val_sorted_rule_scores.csv")
+        # print(f"  - {ranking_metrics_path}")
         
         # Final Summary: Compare Best Model vs Unified Model
         print("\n" + "="*70)
@@ -1315,12 +1218,12 @@ def main():
         print(f"  ROC-AUC:     {unified_metrics_loaded['validation']['roc_auc']:.4f}")
         
         # Compute performance differences
-        acc_diff = unified_metrics_loaded['validation']['accuracy'] - best_model_metrics_loaded['validation']['accuracy']
-        f1_diff = unified_metrics_loaded['validation']['f1_score'] - best_model_metrics_loaded['validation']['f1_score']
+        # acc_diff = unified_metrics_loaded['validation']['accuracy'] - best_model_metrics_loaded['validation']['accuracy']
+        # f1_diff = unified_metrics_loaded['validation']['f1_score'] - best_model_metrics_loaded['validation']['f1_score']
         
-        print(f"\nPerformance Difference (Unified - Best):")
-        print(f"  Accuracy Δ:  {acc_diff:+.4f}")
-        print(f"  F1 Score Δ:  {f1_diff:+.4f}")
+        # print(f"\nPerformance Difference (Unified - Best):")
+        # print(f"  Accuracy Δ:  {acc_diff:+.4f}")
+        # print(f"  F1 Score Δ:  {f1_diff:+.4f}")
         
         print("="*70)
     

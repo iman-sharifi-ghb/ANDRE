@@ -5,6 +5,11 @@ import torch.nn as nn
 import re
 import matplotlib.pyplot as plt
 from collections import Counter
+from ANDRE_Net2 import ANDRE
+import argparse
+import os
+import sys
+import random
 
 def parse_rule_and_generate_data(rule_str, num_samples=1000, sample_type="binary", seed=42):
     """
@@ -784,3 +789,219 @@ def filter_valid_rules(all_rules, head_vars, connected_vars, verbose=True):
         print(f"{'='*70}")
     
     return valid_rules, invalid_rules
+
+
+def top_k_cosine_similar(X_pos, X_neg, k=100):
+    """
+    Compute top-k most similar negative samples for each positive sample using cosine similarity.
+    
+    Args:
+        X_pos: Positive samples tensor [num_pos, dim]
+        X_neg: Negative samples tensor [num_neg, dim]
+        k: Number of top similar negatives to return
+        
+    Returns:
+        topk_indices: Indices of top-k similar negatives for each positive [num_pos, k]
+        topk_values: Cosine similarity values [num_pos, k]
+    """
+    dot_products = torch.mm(X_pos, X_neg.t())
+    pos_norms = torch.norm(X_pos, p=2, dim=1, keepdim=True)
+    neg_norms = torch.norm(X_neg, p=2, dim=1, keepdim=True).t()
+    similarity_matrix = dot_products / (pos_norms * neg_norms + 1e-8)
+    topk_values, topk_indices = torch.topk(similarity_matrix, k, dim=1)
+    return topk_indices, topk_values
+
+
+def mean_reciprocal_rank(ranks):
+    """
+    Compute Mean Reciprocal Rank (MRR) from a list of ranks.
+    
+    Args:
+        ranks: List of ranks (1-based)
+        
+    Returns:
+        mrr: Mean reciprocal rank
+    """
+    reciprocal_ranks = [1.0 / r for r in ranks]
+    return sum(reciprocal_ranks) / len(reciprocal_ranks)
+
+
+def hits_at_k(ranks, k):
+    """
+    Compute Hits@K from a list of ranks.
+    
+    Args:
+        ranks: List of ranks (1-based)
+        k: K value for Hits@K
+        
+    Returns:
+        hits: Hits@K score
+    """
+    hits = sum(1 for r in ranks if r <= k)
+    return hits / len(ranks)
+
+
+def compute_mrr_hits(X_val, y_val, model, k=100, r=100):
+    """
+    Compute MRR and Hits@K on validation set using corrupted samples.
+    
+    Args:
+        X_val: Validation features
+        y_val: Validation labels
+        model: Trained model
+        k: Number of negative samples to corrupt with
+        
+    Returns:
+        mrr: Mean Reciprocal Rank
+        hits: Dict with Hits@1, Hits@3, Hits@5, Hits@10
+    """
+    # Split validation set into positive and negative samples
+    X_val_pos = X_val[y_val == 1]
+    X_val_neg = X_val[y_val == 0]
+
+    corrupted_indices, _ = top_k_cosine_similar(X_val_pos, X_val_neg, k=k)
+
+    ranks = []
+    for i in range(X_val_pos.shape[0]):
+        pos_sample = X_val_pos[i].unsqueeze(0)
+        neg_indices = corrupted_indices[i]
+        neg_samples = X_val_neg[neg_indices]
+        all_samples = torch.cat([pos_sample, neg_samples], dim=0)
+
+        with torch.no_grad():
+            scores, _, _, _ = model(all_samples)
+
+        scores = torch.round(scores * r) / r
+
+        new_scores = []
+        seen = set()
+        for score in scores:
+            if score.item() not in seen:
+                new_scores.append(score)
+                seen.add(score.item())
+        new_scores = torch.tensor(new_scores)
+
+        sorted_indices = torch.argsort(new_scores, descending=True)
+        rank = (sorted_indices == 0).nonzero(as_tuple=True)[0].item() + 1
+        ranks.append(rank)
+
+    mrr = mean_reciprocal_rank(ranks)
+    hits = {k_val: hits_at_k(ranks, k_val) for k_val in [1, 3, 5, 10]}
+
+    return mrr, hits
+
+def schedule_loss_weights(epoch, total_epochs, 
+                        initial_ent_weight=0.0, final_ent_weight=0.1, 
+                        initial_rr_weight=0.0, final_rr_weight=1.0, 
+                        initial_conn_weight=0.0, final_conn_weight=3.0, 
+                        initial_digit_weight=0.0, final_digit_weight=0.05, 
+                        initial_sim_weight=1.0, final_sim_weight=0.1):
+    
+    """Schedule weights for range restriction, connectivity, and digitization losses."""
+    # Linearly increase rr_weight and conn_weight from 0 to their initial values over the epochs
+    ent_weight = initial_ent_weight + (epoch / total_epochs) * (final_ent_weight - initial_ent_weight)
+    rr_weight = initial_rr_weight + (epoch / total_epochs)**2 * (final_rr_weight - initial_rr_weight)
+    conn_weight = initial_conn_weight + (epoch / total_epochs)**2 * (final_conn_weight - initial_conn_weight)
+    digit_weight = initial_digit_weight + (epoch / total_epochs)**2 * (final_digit_weight - initial_digit_weight)
+    sim_weight = initial_sim_weight + (epoch / total_epochs)**2 * (final_sim_weight - initial_sim_weight)
+
+    ent_weight = min(ent_weight, final_ent_weight)
+    rr_weight = min(rr_weight, final_rr_weight)
+    conn_weight = min(conn_weight, final_conn_weight)
+    digit_weight = min(digit_weight, final_digit_weight)
+    sim_weight = min(sim_weight, final_sim_weight)
+    
+    return ent_weight, rr_weight, conn_weight, digit_weight, sim_weight
+
+class Tee:
+    """Duplicate output to both console and log file."""
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log = open(log_file, 'a')
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()  # Ensure immediate write to file
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
+
+
+def str2bool(v):
+    """Convert string to boolean for argparse."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+    
+def get_predicate_name(index, predicate_list, relation_variable_permutations, all_relations):
+    """
+    Convert a feature index in X_train to its symbolic predicate name.
+    """
+    # Get variable mapping (e.g., (0, 1) for X, Y)
+    var_tuple = predicate_list[index]
+    
+    # Variable name mapping
+    var_names = {0: 'X1', 1: 'X2', 2: 'X3', 3: 'X4', 4: 'X5', 5: 'X6'}
+    
+    # Find which relation this belongs to
+    cumulative_index = 0
+    for relation_name, permutations in relation_variable_permutations.items():
+        if cumulative_index <= index < cumulative_index + len(permutations):
+            # Found the relation
+            local_index = index - cumulative_index
+            var_pair = permutations[local_index]
+            
+            # Build symbolic predicate
+            symbolic = f"{relation_name}({var_names[var_pair[0]]}, {var_names[var_pair[1]]})"
+            return symbolic
+        
+        cumulative_index += len(permutations)
+    
+    return "Unknown"
+
+def evaluate_single_rule(rule_weights, X_data, y_data, variable_matrix, device):
+    """
+    Create a single-rule ANDRE model and evaluate its accuracy.
+    
+    Args:
+        rule_weights: List of weights for all neurons in the rule
+        X_data: Input features
+        y_data: True labels
+        variable_matrix: Variable matrix for structured data
+        device: Device to use for computation
+        
+    Returns:
+        Dictionary with accuracy and other metrics
+    """
+    # Find x_data columns as input_dim
+    input_dim = X_data.shape[1]
+
+    # Create single-rule ANDRE model
+    single_rule_model = ANDRE(num_rules=1, pot_body_pred_dim=input_dim, 
+                              variable_matrix=variable_matrix, lr=0.005, weight_decay=1e-4)
+    single_rule_model = single_rule_model.to(device)
+    
+    # Load the weights for this single rule
+    # In ANDRE_Net2, the structure is: rules[0] is a RuleBlock, which contains activation (ProbSumActivation)
+    # The raw_weights are in the activation layer
+    with torch.no_grad():
+        # Stack all neuron weights into a single tensor [input_dim, 3]
+        weights_array = torch.tensor(rule_weights, dtype=torch.float32, device=device)  # [input_dim, 3]
+        # Use log to approximate inverse softmax
+        single_rule_model.rules[0].activation.raw_weights.data = torch.log(weights_array + 1e-10)
+    
+    # Evaluate the single rule
+    single_rule_model.eval()
+    metrics = single_rule_model.evaluate(X_data, y_data)
+    
+    return metrics
