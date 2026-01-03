@@ -531,7 +531,7 @@ def compute_mrr(scores, labels, rule_confidences):
     return mrr, np.array(reciprocal_ranks)
 
 
-def compute_hits_at_k(scores, labels, rule_confidences, k_values=[1, 3, 5, 10]):
+def compute_hits_at_k(scores, labels, rule_confidences, k_values=[1, 3, 10]):
     """
     Compute Hits@K metric for rule ranking.
     
@@ -580,7 +580,7 @@ def compute_hits_at_k(scores, labels, rule_confidences, k_values=[1, 3, 5, 10]):
     return hits_at_k
 
 
-def compute_ranking_metrics(scores, labels, rule_confidences, k_values=[1, 3, 5, 10]):
+def compute_ranking_metrics(scores, labels, rule_confidences, k_values=[1, 3, 10]):
     """
     Compute both MRR and Hits@K metrics for rule ranking.
     

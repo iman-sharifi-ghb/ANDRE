@@ -74,6 +74,8 @@ def parse_args():
                         help='Validation split ratio')
     
     # Loss weights
+    parser.add_argument('--loss_schedule', type=str2bool, default=True,
+                        help='Use loss weight scheduling')
     parser.add_argument('--sim_weight', type=float, default=0.2,
                         help='Weight for similarity penalty')
     parser.add_argument('--ent_weight', type=float, default=0.1,
@@ -84,8 +86,14 @@ def parse_args():
                         help='Weight for connectivity loss')
     parser.add_argument('--digit_weight', type=float, default=0.01,
                         help='Weight for digitization loss')
+    
+
     parser.add_argument('--pp', type=float, default=0.1,
                         help='Perturbation parameter for synthetic data preprocessing')
+    parser.add_argument('--k', type=int, default=100,
+                        help='Parameter k for evaluation metrics')
+    parser.add_argument('--r', type=int, default=100,
+                        help='Parameter r for evaluation metrics')
     
     # Optimization
     parser.add_argument('--lr', type=float, default=0.01,
@@ -101,7 +109,7 @@ def parse_args():
     # Output options
     parser.add_argument('--visualize_weights', type=str2bool, default=False,
                         help='Visualize learned weights')
-    parser.add_argument('--verbose', type=str2bool, default=True,
+    parser.add_argument('--verbose', type=str2bool, default=False,
                         help='Print verbose output')
     parser.add_argument('--save_model', type=str2bool, default=False,
                         help='Save the best model')
@@ -326,6 +334,13 @@ def main():
             print(f"Removed {len(indices_remove)} predicates containing 'X4'.")
             print(f"Old input_dim -> New input_dim: {input_dim}")
 
+    # Remove half of the data samples in X_train and y_train for faster experimentation
+    if args.num_samples < num_samples:
+        num_samples = args.num_samples
+        X_train = X_train[:num_samples].clone()
+        y_train = y_train[:num_samples].clone()
+        print(f"Reduced dataset size to {num_samples} samples for faster experimentation.")
+
     # Create a validation split
     n = X_train.size(0)
     val_size = max(1, int(args.val_split * n))
@@ -389,15 +404,22 @@ def main():
                 model.train()
 
                 # Schedule loss weights
-                ent_weight_, rr_weight_, conn_weight_, digit_weight_, sim_weight_ = schedule_loss_weights(
-                            epoch=epoch, total_epochs=num_epochs,
-                            final_ent_weight=ent_weight, 
-                            final_rr_weight=rr_weight, 
-                            final_conn_weight=conn_weight,
-                            final_digit_weight=digit_weight,
-                            initial_sim_weight=2.0,
-                            final_sim_weight=sim_weight
-                            )
+                if args.loss_schedule:
+                    ent_weight_, rr_weight_, conn_weight_, digit_weight_, sim_weight_ = schedule_loss_weights(
+                                epoch=epoch, total_epochs=num_epochs,
+                                final_ent_weight=ent_weight, 
+                                final_rr_weight=rr_weight, 
+                                final_conn_weight=conn_weight,
+                                final_digit_weight=digit_weight,
+                                initial_sim_weight=2.0,
+                                final_sim_weight=sim_weight
+                                )
+                else:
+                    ent_weight_ = ent_weight
+                    rr_weight_ = rr_weight
+                    conn_weight_ = conn_weight
+                    digit_weight_ = digit_weight
+                    sim_weight_ = sim_weight
 
                 # Shuffle dataset
                 perm = torch.randperm(num_samples, device=device)
@@ -434,11 +456,10 @@ def main():
                         M_head = torch.stack(M_head_list)
 
                         # Range Restriction Loss with asymmetric penalty
-                        eta = 0.5  # Small penalty for values above 1
+                        eta = 0.1  # Small penalty for values above 1
                         mask_below = (M_head < 1.0).float()
                         mask_above = (M_head >= 1.0).float()
-                        rr_loss_1 = mask_below * (M_head - 1.0)**2 + mask_above * eta * (M_head - 1.0)
-                        rr_loss = rr_loss_1
+                        rr_loss = mask_below * (M_head - 1.0)**2 + mask_above * eta * (M_head - 1.0)
                         rr_loss = rr_loss.sum() / len(head_vars) / (num_rules + 1)
 
                         # Connectivity Loss
@@ -454,10 +475,11 @@ def main():
                         conn_loss_1 = 0.5 * conn_loss_1
                         
                         # MSE against constant 2
-                        conn_loss_2 = (M_connected - 2.0)**2
+                        conn_loss_2 = 1 / (input_dim**2) * (M_connected - 2.0)**2
                         
                         # Apply masking: use conn_loss_1 if below 2, conn_loss_2 if above or equal to 2
                         conn_loss = mask_below_2 * conn_loss_1 + mask_above_2 * conn_loss_2
+                        # conn_loss = conn_loss_2
                         conn_loss = conn_loss.sum() / len(connected_vars) / (num_rules + 1)
 
                         # Digitization Loss - encourage M elements to be integers
@@ -474,11 +496,8 @@ def main():
                         total_loss = bce_loss + ent_weight_ * entropy_term + \
                                     rr_weight_ * rr_loss + conn_weight_ * conn_loss + \
                                     digit_weight_ * digit_loss + sim_weight_ * sim_loss
-
-                        # print(f"Epoch {epoch+1}, Batch {i//batch_size+1}: BCE={bce_loss.item():.4f}, \
-                        #       RR={rr_weight_ * rr_loss.item():.4f}, Conn={conn_weight_ * conn_loss.item():.4f}, Digit={digit_weight_ * digit_loss.item():.4f}, \
-                        #       Ent={ent_weight_ * entropy_term.item():.4f}, Sim={sim_weight_ * float(sim_loss):.4f}")
-
+                        # if epoch % 10 == 0:
+                        # print(f"Epoch {epoch+1}, Batch {i//batch_size+1}: BCE={bce_loss.item():.4f}, RR={rr_weight_ * rr_loss.item():.4f}, Conn={conn_weight_ * conn_loss.item():.4f}, Digit={digit_weight_ * digit_loss.item():.4f}, Ent={ent_weight_ * entropy_term.item():.4f}, Sim={sim_weight_ * float(sim_loss):.4f}")
                     else: 
                         entropy_term = torch.stack(weight_entropies).sum()
                         entropy_term = entropy_term / (num_rules + 1) /  input_dim
@@ -660,7 +679,8 @@ def main():
             current_criterion_losses = losses_andre_val if args.best_model_criterion == 'val_loss' else losses_andre_train
             current_min_loss = min(current_criterion_losses)
             
-            if current_min_loss < best_loss:
+            # if current_min_loss < best_loss:
+            if eval_metric > best_eval_metric:
                 print(f"**** New Best Model (based on {args.best_model_criterion}) ****")
                 best_eval_metric = eval_metric
                 best_train_metric = train_metric
@@ -734,10 +754,10 @@ def main():
     X_val_neg = X_val[y_val == 0]
     print(f"Positive validation samples: {X_val_pos.shape[0]}")
     print(f"Negative validation samples: {X_val_neg.shape[0]}")
-    mrr, hits = compute_mrr_hits(X_val, y_val, best_model, k=100)
+    mrr, hits = compute_mrr_hits(X_val, y_val, best_model, k=args.k, r=args.r)
     print(f"Mean Reciprocal Rank (MRR): {mrr:.4f}")
 
-    for k in [1, 3, 5, 10]:
+    for k in [1, 3, 10]:
         print(f"Hits@{k}: {hits[k]:.4f}")
 
     # Plot loss curves (both training and validation)
@@ -878,7 +898,7 @@ def main():
                 sorted_all_rules, 
                 head_vars, 
                 connected_vars,
-                verbose=True
+                verbose=args.verbose
             )
             
             # Use only valid rules for the unified model
@@ -1069,9 +1089,9 @@ def main():
                 print(f"  Training Accuracy: {train_metrics['accuracy']:.4f}")
                 print(f"  Validation Accuracy: {val_metrics['accuracy']:.4f}")
 
-                mrr, hits = compute_mrr_hits(X_val, y_val, unified_model, k=100)
+                mrr, hits = compute_mrr_hits(X_val, y_val, unified_model, k=args.k, r=args.r)
                 print(f"Mean Reciprocal Rank (MRR): {mrr:.4f}")
-                for k in [1, 3, 5, 10]:
+                for k in [1, 3, 10]:
                     print(f"Hits@{k}: {hits[k]:.4f}")
             
             # # Re-compute scores with new rule ordering
