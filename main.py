@@ -94,6 +94,8 @@ def parse_args():
                         help='Parameter k for evaluation metrics')
     parser.add_argument('--r', type=int, default=100,
                         help='Parameter r for evaluation metrics')
+    parser.add_argument('--eta', type=float, default=0.5,
+                        help='Eta parameter for evaluation metrics')
     
     # Optimization
     parser.add_argument('--lr', type=float, default=0.01,
@@ -334,6 +336,48 @@ def main():
             print(f"Removed {len(indices_remove)} predicates containing 'X4'.")
             print(f"Old input_dim -> New input_dim: {input_dim}")
 
+    # Remove predicates with identical variables (e.g., 'sameperson(X1,X1)', 'advisedby(X3,X3)')
+    # Only for advisedby head predicate
+    if not synthetic_data and structured_data and args.head_predicate == 'advisedby(X1, X2)':
+        import re
+        indices_keep = []
+        indices_remove = []
+        
+        for i, p in enumerate(body_predicates):
+            # Extract variables from predicate, e.g., 'sameperson(X1,X1)' -> ['X1', 'X1']
+            match = re.search(r'\((.*?)\)', p)
+            if match:
+                vars_str = match.group(1)
+                vars_list = [v.strip() for v in vars_str.split(',')]
+                # Check if any variable appears more than once (identical variables)
+                if len(vars_list) != len(set(vars_list)):
+                    indices_remove.append(i)
+                else:
+                    indices_keep.append(i)
+            else:
+                # If no variables found, keep the predicate
+                indices_keep.append(i)
+        
+        if not indices_remove:
+            print("No predicates with identical variables were found. No changes made.")
+        else:
+            removed_predicates = [body_predicates[i] for i in indices_remove]
+            print(f"\nRemoving predicates with identical variables:")
+            for p in removed_predicates:
+                print(f"  - {p}")
+            
+            # Update body_predicates
+            body_predicates = [body_predicates[i] for i in indices_keep]
+            variable_matrix, variables = create_V_matrix(body_predicates)
+            head_vars, connected_vars = extract_head_and_connected_vars(head_predicate, variables)
+            # Update X_train (keep columns corresponding to indices_keep)
+            X_train = X_train[:, indices_keep].clone()
+            # Update input_dim
+            input_dim = X_train.shape[1]
+            # Summary
+            print(f"Removed {len(indices_remove)} predicates with identical variables.")
+            print(f"New input_dim: {input_dim}\n")
+
     # Remove half of the data samples in X_train and y_train for faster experimentation
     if args.num_samples < num_samples:
         num_samples = args.num_samples
@@ -456,7 +500,7 @@ def main():
                         M_head = torch.stack(M_head_list)
 
                         # Range Restriction Loss with asymmetric penalty
-                        eta = 0.1  # Small penalty for values above 1
+                        eta = args.eta  # Small penalty for values above 1
                         mask_below = (M_head < 1.0).float()
                         mask_above = (M_head >= 1.0).float()
                         rr_loss = mask_below * (M_head - 1.0)**2 + mask_above * eta * (M_head - 1.0)
@@ -539,7 +583,7 @@ def main():
                             # Range Restriction Loss
                             M_head_list_val = [torch.as_tensor(Ms_val[i_r][head_vars], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules + 1)]
                             M_head_val = torch.stack(M_head_list_val)
-                            eta = 0.5
+                            eta = args.eta  # Small penalty for values above 1
                             mask_below = (M_head_val < 1.0).float()
                             mask_above = (M_head_val >= 1.0).float()
                             rr_loss_val = mask_below * (M_head_val - 1.0)**2 + mask_above * eta * (M_head_val - 1.0)
