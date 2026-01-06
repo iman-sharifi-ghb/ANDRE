@@ -34,6 +34,46 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
+class BalancedBatchSampler:
+    """Sampler that yields balanced batches with equal positive/negative samples."""
+    def __init__(self, labels, batch_size):
+        self.labels = labels
+        self.batch_size = batch_size
+        
+        # Get indices for positive and negative samples
+        self.pos_indices = torch.where(labels == 1)[0]
+        self.neg_indices = torch.where(labels == 0)[0]
+        
+        self.n_pos = len(self.pos_indices)
+        self.n_neg = len(self.neg_indices)
+        
+        # Batch size per class
+        self.batch_size_per_class = batch_size // 2
+        
+    def __iter__(self):
+        # Shuffle indices
+        pos_perm = torch.randperm(self.n_pos)
+        neg_perm = torch.randperm(self.n_neg)
+        
+        pos_indices_shuffled = self.pos_indices[pos_perm]
+        neg_indices_shuffled = self.neg_indices[neg_perm]
+        
+        # Create batches
+        n_batches = min(self.n_pos, self.n_neg) // self.batch_size_per_class
+        
+        for i in range(n_batches):
+            pos_batch = pos_indices_shuffled[i * self.batch_size_per_class:(i + 1) * self.batch_size_per_class]
+            neg_batch = neg_indices_shuffled[i * self.batch_size_per_class:(i + 1) * self.batch_size_per_class]
+            
+            # Combine and shuffle batch indices
+            batch_indices = torch.cat([pos_batch, neg_batch])
+            batch_perm = torch.randperm(len(batch_indices))
+            
+            yield batch_indices[batch_perm]
+    
+    def __len__(self):
+        return min(self.n_pos, self.n_neg) // self.batch_size_per_class
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -379,11 +419,11 @@ def main():
             print(f"New input_dim: {input_dim}\n")
 
     # Remove half of the data samples in X_train and y_train for faster experimentation
-    if args.num_samples < num_samples:
-        num_samples = args.num_samples
-        X_train = X_train[:num_samples].clone()
-        y_train = y_train[:num_samples].clone()
-        print(f"Reduced dataset size to {num_samples} samples for faster experimentation.")
+    # if args.num_samples < num_samples:
+    #     num_samples = args.num_samples
+    #     X_train = X_train[:num_samples].clone()
+    #     y_train = y_train[:num_samples].clone()
+    #     print(f"Reduced dataset size to {num_samples} samples for faster experimentation.")
 
     # Create a validation split
     n = X_train.size(0)
@@ -465,23 +505,21 @@ def main():
                     digit_weight_ = digit_weight
                     sim_weight_ = sim_weight
 
-                # Shuffle dataset
-                perm = torch.randperm(num_samples, device=device)
-                X_train_shuffled = X_train[perm]
-                y_train_shuffled = y_train[perm]
-
                 epoch_loss = 0.0
 
-                # Mini-batch training loop
-                for i in range(0, num_samples, batch_size):
-                    xb = X_train_shuffled[i:i + batch_size]
-                    yb = y_train_shuffled[i:i + batch_size]
+                # Create balanced batch sampler
+                batch_sampler = BalancedBatchSampler(y_train, batch_size)
+                
+                # Mini-batch training loop with balanced batches
+                for batch_indices in batch_sampler:
+                    xb = X_train[batch_indices]
+                    yb = y_train[batch_indices]
 
                     model.optimizer.zero_grad()
                     outputs, model_weights, weight_entropies, Ms = model(xb)
 
-                    # Binary Cross-Entropy Loss
-                    bce_loss = model.criterion(outputs, yb)
+                    # Binary Cross-Entropy Loss (no weighting needed with balanced batches)
+                    bce_loss = nn.BCELoss()(outputs, yb)
 
                     # Similarity Penalty
                     sim_loss = 0.0
@@ -541,7 +579,7 @@ def main():
                                     rr_weight_ * rr_loss + conn_weight_ * conn_loss + \
                                     digit_weight_ * digit_loss + sim_weight_ * sim_loss
                         # if epoch % 10 == 0:
-                        # print(f"Epoch {epoch+1}, Batch {i//batch_size+1}: BCE={bce_loss.item():.4f}, RR={rr_weight_ * rr_loss.item():.4f}, Conn={conn_weight_ * conn_loss.item():.4f}, Digit={digit_weight_ * digit_loss.item():.4f}, Ent={ent_weight_ * entropy_term.item():.4f}, Sim={sim_weight_ * float(sim_loss):.4f}")
+                        #     print(f"Epoch {epoch+1}, Batch {i//batch_size+1}: BCE={bce_loss.item():.4f}, RR={rr_weight_ * rr_loss.item():.4f}, Conn={conn_weight_ * conn_loss.item():.4f}, Digit={digit_weight_ * digit_loss.item():.4f}, Ent={ent_weight_ * entropy_term.item():.4f}, Sim={sim_weight_ * float(sim_loss):.4f}")
                     else: 
                         entropy_term = torch.stack(weight_entropies).sum()
                         entropy_term = entropy_term / (num_rules + 1) /  input_dim
@@ -746,23 +784,91 @@ def main():
     best_model.load_state_dict(best_state_dict)
     best_model = best_model.to(device)
 
+    # Find optimal decision threshold on validation set
+    print("\n=== Finding Optimal Decision Threshold ===")
+    best_model.eval()
+    with torch.no_grad():
+        val_probs = best_model(X_val)[0].cpu().numpy().flatten()
+        y_val_np = y_val.cpu().numpy().flatten()
+        
+        # Try different thresholds
+        thresholds = np.linspace(0.05, 0.95, 91)
+        best_f1 = 0
+        best_threshold = 0.5
+        threshold_results = []
+        
+        for threshold in thresholds:
+            y_pred = (val_probs > threshold).astype(float)
+            tp = ((y_pred == 1) & (y_val_np == 1)).sum()
+            fp = ((y_pred == 1) & (y_val_np == 0)).sum()
+            fn = ((y_pred == 0) & (y_val_np == 1)).sum()
+            tn = ((y_pred == 0) & (y_val_np == 0)).sum()
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+            
+            threshold_results.append({
+                'threshold': threshold,
+                'f1': f1,
+                'precision': precision,
+                'recall': recall,
+                'accuracy': accuracy
+            })
+            
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+        
+        print(f"Optimal decision threshold: {best_threshold:.3f}")
+        print(f"  F1-Score: {best_f1:.4f}")
+        
+        # Show metrics at default 0.5 threshold for comparison
+        default_result = [r for r in threshold_results if abs(r['threshold'] - 0.5) < 0.01][0]
+        print(f"\nComparison with default threshold (0.5):")
+        print(f"  Default - F1: {default_result['f1']:.4f}, Precision: {default_result['precision']:.4f}, Recall: {default_result['recall']:.4f}")
+        
+        optimal_result = [r for r in threshold_results if abs(r['threshold'] - best_threshold) < 0.01][0]
+        print(f"  Optimal - F1: {optimal_result['f1']:.4f}, Precision: {optimal_result['precision']:.4f}, Recall: {optimal_result['recall']:.4f}")
+        
+        # Store optimal threshold in model (as an attribute)
+        best_model.decision_threshold = best_threshold
+        
+        # Save threshold results to file
+        threshold_results_path = os.path.join(results_dir, f"threshold_analysis_{today_date}_{today_hour}.json")
+        with open(threshold_results_path, 'w') as f:
+            json.dump({
+                'optimal_threshold': float(best_threshold),
+                'optimal_f1': float(best_f1),
+                'default_threshold_metrics': default_result,
+                'optimal_threshold_metrics': optimal_result,
+                'all_thresholds': threshold_results
+            }, f, indent=2)
+        print(f"Saved threshold analysis to: {threshold_results_path}")
+
     # Evaluate best model
 
-    print("\n=== Best Model Training Evaluation ===")
+    print("\n=== Best Model Training Evaluation (with default threshold 0.5) ===")
 
-    best_model.print_evaluation(X_train, y_train)
+    best_model.print_evaluation(X_train, y_train, threshold=0.5)
 
-    print("\n=== Best Model Evaluation on Validation Set ===")
-    best_model.print_evaluation(X_val, y_val)
+    print("\n=== Best Model Evaluation on Validation Set (with default threshold 0.5) ===")
+    best_model.print_evaluation(X_val, y_val, threshold=0.5)
+    
+    print("\n=== Best Model Evaluation on Validation Set (with optimal threshold) ===")
+    best_model.print_evaluation(X_val, y_val, threshold=best_threshold)
     
     # Save best model metrics to JSON
     best_model.eval()
     with torch.no_grad():
-        best_train_metrics = best_model.evaluate(X_train, y_train)
-        best_val_metrics = best_model.evaluate(X_val, y_val)
+        best_train_metrics = best_model.evaluate(X_train, y_train, threshold=best_threshold)
+        best_val_metrics = best_model.evaluate(X_val, y_val, threshold=best_threshold)
+        best_val_metrics_default = best_model.evaluate(X_val, y_val, threshold=0.5)
     
     best_model_metrics = {
         'num_rules': best_num_rules,
+        'optimal_threshold': float(best_threshold),
         'training': {
             'accuracy': float(best_train_metrics['accuracy']),
             'precision': float(best_train_metrics['precision']),
@@ -771,13 +877,21 @@ def main():
             'roc_auc': float(best_train_metrics['roc_auc']),
             'specificity': float(best_train_metrics['specificity'])
         },
-        'validation': {
+        'validation_optimal_threshold': {
             'accuracy': float(best_val_metrics['accuracy']),
             'precision': float(best_val_metrics['precision']),
             'recall': float(best_val_metrics['recall']),
             'f1_score': float(best_val_metrics['f1_score']),
             'roc_auc': float(best_val_metrics['roc_auc']),
             'specificity': float(best_val_metrics['specificity'])
+        },
+        'validation_default_threshold': {
+            'accuracy': float(best_val_metrics_default['accuracy']),
+            'precision': float(best_val_metrics_default['precision']),
+            'recall': float(best_val_metrics_default['recall']),
+            'f1_score': float(best_val_metrics_default['f1_score']),
+            'roc_auc': float(best_val_metrics_default['roc_auc']),
+            'specificity': float(best_val_metrics_default['specificity'])
         },
         'best_model_criterion': args.best_model_criterion,
         'final_train_loss': float(best_losses_train[-1]) if best_losses_train else None,
@@ -1264,11 +1378,11 @@ def main():
             best_model_metrics_loaded = json.load(f)
         
         print(f"\nBest Model (from training) - {best_num_rules} rules:")
-        print(f"  Accuracy:    {best_model_metrics_loaded['validation']['accuracy']:.4f}")
-        print(f"  Precision:   {best_model_metrics_loaded['validation']['precision']:.4f}")
-        print(f"  Recall:      {best_model_metrics_loaded['validation']['recall']:.4f}")
-        print(f"  F1 Score:    {best_model_metrics_loaded['validation']['f1_score']:.4f}")
-        print(f"  ROC-AUC:     {best_model_metrics_loaded['validation']['roc_auc']:.4f}")
+        print(f"  Accuracy:    {best_model_metrics_loaded['validation_optimal_threshold']['accuracy']:.4f}")
+        print(f"  Precision:   {best_model_metrics_loaded['validation_optimal_threshold']['precision']:.4f}")
+        print(f"  Recall:      {best_model_metrics_loaded['validation_optimal_threshold']['recall']:.4f}")
+        print(f"  F1 Score:    {best_model_metrics_loaded['validation_optimal_threshold']['f1_score']:.4f}")
+        print(f"  ROC-AUC:     {best_model_metrics_loaded['validation_optimal_threshold']['roc_auc']:.4f}")
         
         # Get unified model metrics (already computed earlier)
         with open(unified_metrics_path, 'r') as f:
