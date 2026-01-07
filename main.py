@@ -97,7 +97,9 @@ def parse_args():
     
     # Model architecture
     parser.add_argument('--num_rules', type=int, default=4,
-                        help='Maximum number of rules to learn')
+                        help='Maximum number of rules to learn (used when rule_counts is not specified)')
+    parser.add_argument('--rule_counts', type=str, default=None,
+                        help='Comma-separated list of rule counts to train (e.g., "1,3,5,10"). If specified, overrides num_rules iteration.')
     parser.add_argument('--input_dim', type=int, default=6,
                         help='Input dimension (for unstructured data)')
     
@@ -219,7 +221,16 @@ def main():
     dataset_type = args.dataset_type
     seed = args.seed
     
-    Num_rules = args.num_rules
+    # Determine which rule counts to train
+    if args.rule_counts:
+        # Parse comma-separated list of rule counts
+        rule_counts_to_train = [int(x.strip()) for x in args.rule_counts.split(',')]
+        print(f"Training ANDRE with specific rule counts: {rule_counts_to_train}")
+    else:
+        # Use range from 1 to num_rules (inclusive)
+        rule_counts_to_train = list(range(1, args.num_rules + 1))
+        print(f"Training ANDRE with rule counts from 1 to {args.num_rules}")
+    
     num_epochs = args.num_epochs
     num_restarts = args.num_restarts
     batch_size = args.batch_size
@@ -473,10 +484,10 @@ def main():
     # Store all discovered rules with their accuracies
     all_discovered_rules = []
 
-    for num_rules in range(Num_rules):
+    for num_rules in rule_counts_to_train:
         for restart in range(num_restarts):
-            print(f"\n=== Training ANDRE with {num_rules + 1} rules, Restart {restart + 1}/{num_restarts} ===")
-            model = ANDRE(num_rules + 1, pot_body_pred_dim=input_dim, 
+            print(f"\n=== Training ANDRE with {num_rules} rules, Restart {restart + 1}/{num_restarts} ===")
+            model = ANDRE(num_rules, pot_body_pred_dim=input_dim, 
                          variable_matrix=variable_matrix if structured_data else None, 
                          lr=args.lr, weight_decay=args.weight_decay)
             model = model.to(device)
@@ -524,9 +535,9 @@ def main():
                     # Similarity Penalty
                     sim_loss = 0.0
                     num_sim_pairs = 0
-                    for i in range(num_rules + 1):
+                    for i in range(num_rules):
                         wi = model_weights[i].view(input_dim, -1)
-                        for j in range(i + 1, num_rules + 1):
+                        for j in range(i + 1, num_rules):
                             wj = model_weights[j].view(input_dim, -1)
                             sim_loss += nn.CosineSimilarity(dim=1)(wi, wj).mean()
                             num_sim_pairs += 1
@@ -534,7 +545,7 @@ def main():
 
                     if structured_data:
                         # Build tensors from M entries (handle lists or tensors)
-                        M_head_list = [torch.as_tensor(Ms[i][head_vars], device=xb.device, dtype=xb.dtype) for i in range(num_rules + 1)]
+                        M_head_list = [torch.as_tensor(Ms[i][head_vars], device=xb.device, dtype=xb.dtype) for i in range(num_rules)]
                         M_head = torch.stack(M_head_list)
 
                         # Range Restriction Loss with asymmetric penalty
@@ -542,10 +553,10 @@ def main():
                         mask_below = (M_head < 1.0).float()
                         mask_above = (M_head >= 1.0).float()
                         rr_loss = mask_below * (M_head - 1.0)**2 + mask_above * eta * (M_head - 1.0)
-                        rr_loss = rr_loss.sum() / len(head_vars) / (num_rules + 1)
+                        rr_loss = rr_loss.sum() / len(head_vars) / num_rules
 
                         # Connectivity Loss
-                        M_connected_list = [torch.as_tensor(Ms[i][connected_vars], device=xb.device, dtype=xb.dtype) for i in range(num_rules + 1)]
+                        M_connected_list = [torch.as_tensor(Ms[i][connected_vars], device=xb.device, dtype=xb.dtype) for i in range(num_rules)]
                         M_connected = torch.stack(M_connected_list)  # tensor form
 
                         # Connectivity Loss with conditional masking
@@ -562,17 +573,17 @@ def main():
                         # Apply masking: use conn_loss_1 if below 2, conn_loss_2 if above or equal to 2
                         conn_loss = mask_below_2 * conn_loss_1 + mask_above_2 * conn_loss_2
                         # conn_loss = conn_loss_2
-                        conn_loss = conn_loss.sum() / len(connected_vars) / (num_rules + 1)
+                        conn_loss = conn_loss.sum() / len(connected_vars) / num_rules
 
                         # Digitization Loss - encourage M elements to be integers
-                        M_all_list = [torch.as_tensor(Ms[i], device=xb.device, dtype=xb.dtype) for i in range(num_rules + 1)]
-                        M_all = torch.stack(M_all_list)  # [num_rules+1, num_variables]
+                        M_all_list = [torch.as_tensor(Ms[i], device=xb.device, dtype=xb.dtype) for i in range(num_rules)]
+                        M_all = torch.stack(M_all_list)  # [num_rules, num_variables]
                         digit_loss = 0.5 * (1 - torch.sin(2 * math.pi * M_all + math.pi / 2)).sum()
                         digit_loss = digit_loss / M_all.numel()
 
                         # Entropy Loss
                         entropy_term = torch.stack(weight_entropies).sum()
-                        entropy_term = entropy_term / (num_rules + 1) /  input_dim
+                        entropy_term = entropy_term / num_rules /  input_dim
 
                         # Total Loss
                         total_loss = bce_loss + ent_weight_ * entropy_term + \
@@ -582,7 +593,7 @@ def main():
                         #     print(f"Epoch {epoch+1}, Batch {i//batch_size+1}: BCE={bce_loss.item():.4f}, RR={rr_weight_ * rr_loss.item():.4f}, Conn={conn_weight_ * conn_loss.item():.4f}, Digit={digit_weight_ * digit_loss.item():.4f}, Ent={ent_weight_ * entropy_term.item():.4f}, Sim={sim_weight_ * float(sim_loss):.4f}")
                     else: 
                         entropy_term = torch.stack(weight_entropies).sum()
-                        entropy_term = entropy_term / (num_rules + 1) /  input_dim
+                        entropy_term = entropy_term / num_rules /  input_dim
                         total_loss = bce_loss + ent_weight_ * entropy_term + sim_weight_ * sim_loss
 
                     total_loss.backward()
@@ -610,25 +621,25 @@ def main():
                             # Similarity Penalty
                             sim_loss_val = 0.0
                             num_sim_pairs = 0
-                            for i_r in range(num_rules + 1):
+                            for i_r in range(num_rules):
                                 wi = model_weights_val[i_r].view(input_dim, -1)
-                                for j_r in range(i_r + 1, num_rules + 1):
+                                for j_r in range(i_r + 1, num_rules):
                                     wj = model_weights_val[j_r].view(input_dim, -1)
                                     sim_loss_val += nn.CosineSimilarity(dim=1)(wi, wj).mean()
                                     num_sim_pairs += 1
                             sim_loss_val = sim_loss_val / num_sim_pairs if num_sim_pairs > 0 else 0
                             
                             # Range Restriction Loss
-                            M_head_list_val = [torch.as_tensor(Ms_val[i_r][head_vars], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules + 1)]
+                            M_head_list_val = [torch.as_tensor(Ms_val[i_r][head_vars], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules)]
                             M_head_val = torch.stack(M_head_list_val)
                             eta = args.eta  # Small penalty for values above 1
                             mask_below = (M_head_val < 1.0).float()
                             mask_above = (M_head_val >= 1.0).float()
                             rr_loss_val = mask_below * (M_head_val - 1.0)**2 + mask_above * eta * (M_head_val - 1.0)
-                            rr_loss_val = rr_loss_val.sum() / len(head_vars) / (num_rules + 1)
+                            rr_loss_val = rr_loss_val.sum() / len(head_vars) / num_rules
                             
                             # Connectivity Loss
-                            M_connected_list_val = [torch.as_tensor(Ms_val[i_r][connected_vars], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules + 1)]
+                            M_connected_list_val = [torch.as_tensor(Ms_val[i_r][connected_vars], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules)]
                             M_connected_val = torch.stack(M_connected_list_val)
                             mask_below_2 = (M_connected_val < 2.0).float()
                             mask_above_2 = (M_connected_val >= 2.0).float()
@@ -636,30 +647,30 @@ def main():
                             conn_loss_1_val = 0.5 * conn_loss_1_val
                             conn_loss_2_val = (M_connected_val - 2.0)**2
                             conn_loss_val = mask_below_2 * conn_loss_1_val + mask_above_2 * conn_loss_2_val
-                            conn_loss_val = conn_loss_val.sum() / len(connected_vars) / (num_rules + 1)
+                            conn_loss_val = conn_loss_val.sum() / len(connected_vars) / num_rules
                             
                             # Digitization Loss
-                            M_all_list_val = [torch.as_tensor(Ms_val[i_r], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules + 1)]
+                            M_all_list_val = [torch.as_tensor(Ms_val[i_r], device=xb_val.device, dtype=xb_val.dtype) for i_r in range(num_rules)]
                             M_all_val = torch.stack(M_all_list_val)
                             digit_loss_val = 0.5 * (1 - torch.sin(2 * math.pi * M_all_val + math.pi / 2)).sum()
                             digit_loss_val = digit_loss_val / M_all_val.numel()
                             
                             # Entropy Loss
                             entropy_term_val = torch.stack(weight_entropies_val).sum()
-                            entropy_term_val = entropy_term_val / (num_rules + 1) / input_dim
+                            entropy_term_val = entropy_term_val / num_rules / input_dim
                             
                             total_loss_val = bce_loss_val + ent_weight_ * entropy_term_val + \
                                            rr_weight_ * rr_loss_val + conn_weight_ * conn_loss_val + \
                                            digit_weight_ * digit_loss_val + sim_weight_ * sim_loss_val
                         else:
                             entropy_term_val = torch.stack(weight_entropies_val).sum()
-                            entropy_term_val = entropy_term_val / (num_rules + 1) / input_dim
+                            entropy_term_val = entropy_term_val / num_rules / input_dim
                             
                             sim_loss_val = 0.0
                             num_sim_pairs = 0
-                            for i_r in range(num_rules + 1):
+                            for i_r in range(num_rules):
                                 wi = model_weights_val[i_r].view(input_dim, -1)
-                                for j_r in range(i_r + 1, num_rules + 1):
+                                for j_r in range(i_r + 1, num_rules):
                                     wj = model_weights_val[j_r].view(input_dim, -1)
                                     sim_loss_val += nn.CosineSimilarity(dim=1)(wi, wj).mean()
                                     num_sim_pairs += 1
@@ -740,7 +751,7 @@ def main():
                         'rule': full_subrule,
                         'training_accuracy': subrule_metrics['accuracy'],
                         'eval_accuracy': subrule_eval_metrics['accuracy'],
-                        'num_rules': num_rules + 1,
+                        'num_rules': num_rules,
                         'restart': restart + 1,
                         'subrule_idx': rule_idx + 1,
                         'training_precision': subrule_metrics['precision'],
@@ -752,7 +763,7 @@ def main():
                         'weights': Weights_andre_raw[rule_idx]  # Store RAW weights, not softmaxed
                     })
 
-            print(f"Num Rules: {num_rules + 1}, Restart {restart+1}/{num_restarts}, Train Metric: {train_metric:.4f}, Evaluation Metric: {eval_metric:.4f}.")
+            print(f"Num Rules: {num_rules}, Restart {restart+1}/{num_restarts}, Train Metric: {train_metric:.4f}, Evaluation Metric: {eval_metric:.4f}.")
             
             # Print current discovered subrules count
             print(f"Total unique subrules discovered so far: {len(all_discovered_rules)}")
@@ -770,7 +781,7 @@ def main():
                 best_state_dict = deepcopy(model.state_dict())
                 best_losses_train = losses_andre_train
                 best_losses_val = losses_andre_val
-                best_num_rules = num_rules + 1
+                best_num_rules = num_rules
                 best_loss = current_min_loss
 
                 if train_metric > acc_threshold and eval_metric > acc_threshold:
