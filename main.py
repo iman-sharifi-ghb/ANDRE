@@ -171,6 +171,12 @@ def parse_args():
                         choices=['val_accuracy', 'val_f1', 'train_accuracy', 'val_precision', 'nr_nb_ratio'],
                         help='Metric to use as rule confidence for ranking (MRR/Hits@K). nr_nb_ratio uses N_r/N_b ratio from validation set')
     
+    # Data preprocessing options
+    parser.add_argument('--perturb', type=str2bool, default=True,
+                        help='Perturb binary data by adding small noise for better training')
+    parser.add_argument('--np', type=float, default=0.0,
+                        help='Noise percentage for label flipping (0.0 to 1.0). Default is 0 (no noise)')
+    
     return parser.parse_args()
 
 
@@ -251,10 +257,9 @@ def main():
             head_predicate = "h"
             variable_matrix, variables = None, None
             body_predicates = None
-            head_predicate = None
         else:
             body_predicates = ["father(X1, X2)", "father(X2, X3)", "father(X1, X3)", 
-                             "mother(X1, X2)", "mother(X2, X3)", "mother(X1, X3)"]
+                               "mother(X1, X2)", "mother(X2, X3)", "mother(X1, X3)"]
             head_predicate = args.head_predicate
             variable_matrix, variables = create_V_matrix(body_predicates)
             head_vars, connected_vars = extract_head_and_connected_vars(head_predicate, variables)
@@ -271,7 +276,7 @@ def main():
             X_train = torch.rand(num_samples, input_dim)
             acc_threshold = args.acc_threshold
 
-        if check_binary_dataset(X_train):
+        if check_binary_dataset(X_train) and args.perturb:
             # perturb data by adding small noise to zero and reducing one to less than one
             X_train = X_train - args.pp * torch.rand_like(X_train) * (X_train - 0.5).sign()
             # clip to [0, 1]
@@ -310,11 +315,14 @@ def main():
 
         if check_binary_dataset(X_train):
             dataset_type = "binary"
-            print("X_train is a binary dataset. We are perturbing the data for a better training.")
-            # perturb data by adding small noise to zero and reducing one to less than one
-            X_train = X_train - args.pp * torch.rand_like(X_train) * (X_train - 0.5).sign()
-            # clip to [0, 1]
-            X_train = torch.clamp(X_train, 0.0, 1.0)
+            if args.perturb:
+                print("X_train is a binary dataset. We are perturbing the data for a better training.")
+                # perturb data by adding small noise to zero and reducing one to less than one
+                X_train = X_train - args.pp * torch.rand_like(X_train) * (X_train - 0.5).sign()
+                # clip to [0, 1]
+                X_train = torch.clamp(X_train, 0.0, 1.0)
+            else:
+                print("X_train is a binary dataset. Perturbation is disabled.")
 
         # Load the predicate list
         with open(file_path + 'predicate.list', 'rb') as f:
@@ -461,6 +469,20 @@ def main():
     # update num_samples to reflect new training set size
     num_samples = X_train.size(0)
 
+    # Apply label noise to training set only (not validation set)
+    if args.np > 0:
+        num_noisy_labels = int(args.np * num_samples)
+        if num_noisy_labels > 0:
+            # Set random seed for reproducibility
+            torch.manual_seed(seed)
+            noise_indices = torch.randperm(num_samples)[:num_noisy_labels]
+            y_train[noise_indices] = 1 - y_train[noise_indices]  # Flip labels (0->1, 1->0)
+            print(f"Applied label noise: flipped {num_noisy_labels} labels ({args.np*100:.1f}% of training set)")
+        else:
+            print(f"Label noise percentage too small to flip any labels ({args.np*100:.1f}%)")
+    else:
+        print("No label noise applied (np=0)")
+
     # Move to device
     X_train = X_train.to(device)
     y_train = y_train.to(device)
@@ -527,7 +549,7 @@ def main():
                     yb = y_train[batch_indices]
 
                     model.optimizer.zero_grad()
-                    outputs, model_weights, weight_entropies, Ms = model(xb)
+                    outputs, andre_probs, weight_entropies, Ms = model(xb)
 
                     # Binary Cross-Entropy Loss (no weighting needed with balanced batches)
                     bce_loss = nn.BCELoss()(outputs, yb)
@@ -536,9 +558,9 @@ def main():
                     sim_loss = 0.0
                     num_sim_pairs = 0
                     for i in range(num_rules):
-                        wi = model_weights[i].view(input_dim, -1)
+                        wi = andre_probs[i].view(input_dim, -1)
                         for j in range(i + 1, num_rules):
-                            wj = model_weights[j].view(input_dim, -1)
+                            wj = andre_probs[j].view(input_dim, -1)
                             sim_loss += nn.CosineSimilarity(dim=1)(wi, wj).mean()
                             num_sim_pairs += 1
                     sim_loss = sim_loss / num_sim_pairs if num_sim_pairs > 0 else 0
@@ -613,7 +635,7 @@ def main():
                         xb_val = X_val[i:i + batch_size]
                         yb_val = y_val[i:i + batch_size]
                         
-                        outputs_val, model_weights_val, weight_entropies_val, Ms_val = model(xb_val)
+                        outputs_val, andre_probs_val, weight_entropies_val, Ms_val = model(xb_val)
                         bce_loss_val = model.criterion(outputs_val, yb_val)
                         
                         # Compute other loss components for validation
@@ -622,9 +644,9 @@ def main():
                             sim_loss_val = 0.0
                             num_sim_pairs = 0
                             for i_r in range(num_rules):
-                                wi = model_weights_val[i_r].view(input_dim, -1)
+                                wi = andre_probs_val[i_r].view(input_dim, -1)
                                 for j_r in range(i_r + 1, num_rules):
-                                    wj = model_weights_val[j_r].view(input_dim, -1)
+                                    wj = andre_probs_val[j_r].view(input_dim, -1)
                                     sim_loss_val += nn.CosineSimilarity(dim=1)(wi, wj).mean()
                                     num_sim_pairs += 1
                             sim_loss_val = sim_loss_val / num_sim_pairs if num_sim_pairs > 0 else 0
@@ -669,9 +691,9 @@ def main():
                             sim_loss_val = 0.0
                             num_sim_pairs = 0
                             for i_r in range(num_rules):
-                                wi = model_weights_val[i_r].view(input_dim, -1)
+                                wi = andre_probs_val[i_r].view(input_dim, -1)
                                 for j_r in range(i_r + 1, num_rules):
-                                    wj = model_weights_val[j_r].view(input_dim, -1)
+                                    wj = andre_probs_val[j_r].view(input_dim, -1)
                                     sim_loss_val += nn.CosineSimilarity(dim=1)(wi, wj).mean()
                                     num_sim_pairs += 1
                             sim_loss_val = sim_loss_val / num_sim_pairs if num_sim_pairs > 0 else 0
@@ -683,21 +705,25 @@ def main():
                 losses_andre_val.append(val_loss)
 
             # Extract RAW weights from model parameters (not softmaxed)
-            Weights_andre_raw = []
+            raw_weights = []
             for rule_block in model.rules:
                 # Get raw_weights from the activation layer [D, 3]
                 raw_w = rule_block.activation.raw_weights.detach().cpu().numpy()
-                Weights_andre_raw.append(raw_w.tolist())
+                raw_weights.append(raw_w.tolist())
 
-            # Extract softmaxed weights for rule interpretation
-            Weights_andre = []
-            for rule_weights in model_weights:
-                rule_weights = rule_weights.detach().cpu().numpy()
-                body_predicate_weights = rule_weights.reshape(-1, 3)
-                Weights_andre.append(body_predicate_weights.tolist())
+            # Extract softmaxed probabilities for rule interpretation
+            # Do a forward pass to get the softmaxed probabilities
+            with torch.no_grad():
+                _, andre_probs_output, _, _ = model(X_train[:min(100, len(X_train))])
+            
+            andre_probs = []
+            for rule_probs_tensor in andre_probs_output:
+                rule_probs_tensor = rule_probs_tensor.detach().cpu().numpy()
+                body_predicate_probs = rule_probs_tensor.reshape(-1, 3)
+                andre_probs.append(body_predicate_probs.tolist())
 
             # Rule interpretation
-            final_rule = extract_rules(Weights_andre=Weights_andre, X_train=X_train, 
+            final_rule = extract_rules(andre_probs=andre_probs, X_train=X_train, 
                                     dataset_type=dataset_type, body_predicates=body_predicates,
                                     head_predicate=head_predicate)
             
@@ -715,28 +741,29 @@ def main():
             overall_metric = 0.5 * (train_metric + eval_metric)
 
             # Store each individual subrule with its metrics
-            for rule_idx, rule_weights in enumerate(Weights_andre):
+            for rule_idx, rule_probs in enumerate(andre_probs):
                 # Extract individual rule text
-                if dataset_type == "binary":
-                    preds = interpret_neuron_weights(body_preds=body_predicates, Weights=rule_weights)
-                else:
-                    sample_pred_values = X_train[0].cpu().numpy()
-                    preds = interpret_neuron_weights_entropy(sample_pred_values, rule_weights)
+                # if dataset_type == "binary":
+                #     preds = interpret_neuron_weights(body_preds=body_predicates, andre_probs=rule_probs)
+                # else:
+                #     sample_pred_values = X_train[0].cpu().numpy()
+                #     preds = interpret_neuron_weights_entropy(sample_pred_values, rule_probs)
+                preds = interpret_neuron_weights(body_preds=body_predicates, andre_probs=rule_probs)
                 
                 refined_preds = [pred for pred in preds if pred != '1' and pred != '?']
                 subrule_text = " and ".join(refined_preds) if refined_preds else "true"
                 full_subrule = f"{head_predicate} :- {subrule_text}."
                 
-                # Evaluate this individual subrule
+                # Evaluate this individual subrule using RAW weights
                 subrule_metrics = evaluate_single_rule(
-                    rule_weights,
+                    raw_weights[rule_idx],
                     X_train,
                     y_train,
                     variable_matrix if structured_data else None,
                     device
                 )
                 subrule_eval_metrics = evaluate_single_rule(
-                    rule_weights,
+                    raw_weights[rule_idx],
                     X_val,
                     y_val,
                     variable_matrix if structured_data else None,
@@ -760,7 +787,7 @@ def main():
                         'eval_precision': subrule_eval_metrics['precision'],
                         'eval_recall': subrule_eval_metrics['recall'],
                         'eval_f1': subrule_eval_metrics['f1_score'],
-                        'weights': Weights_andre_raw[rule_idx]  # Store RAW weights, not softmaxed
+                        'raw_weights': raw_weights[rule_idx]  # Store RAW weights, not softmaxed
                     })
 
             print(f"Num Rules: {num_rules}, Restart {restart+1}/{num_restarts}, Train Metric: {train_metric:.4f}, Evaluation Metric: {eval_metric:.4f}.")
@@ -791,7 +818,7 @@ def main():
     # Load the best model
     best_model = ANDRE(best_num_rules, pot_body_pred_dim=input_dim, 
                       variable_matrix=variable_matrix if structured_data else None, 
-                      lr=0.005, weight_decay=1e-4)
+                      lr=args.lr, weight_decay=args.weight_decay)
     best_model.load_state_dict(best_state_dict)
     best_model = best_model.to(device)
 
@@ -942,19 +969,19 @@ def main():
         plt.savefig(f"{results_dir}/loss_curve_{today_date}_{today_hour}.png", dpi=150, bbox_inches='tight')
         plt.show()
 
-    _, andre_weights, _, _ = best_model(X_val)
+    _, andre_probs_output, _, _ = best_model(X_val)
 
-    Weights_andre = []
-    for rule_weights in andre_weights:
-        rule_weights = rule_weights.detach().cpu().numpy()
-        body_predicate_weights = rule_weights.reshape(-1, 3)
-        Weights_andre.append(body_predicate_weights.tolist())
+    andre_probs = []
+    for rule_probs in andre_probs_output:
+        rule_probs = rule_probs.detach().cpu().numpy()
+        body_predicate_probs = rule_probs.reshape(-1, 3)
+        andre_probs.append(body_predicate_probs.tolist())
 
     if visualize_weights:
-        plot_andre_weights(Weights_andre, input_dim=input_dim, predicates=body_predicates, structured_data=structured_data)
+        plot_andre_weights(andre_probs, input_dim=input_dim, predicates=body_predicates, structured_data=structured_data)
 
     # Rule interpretation
-    final_rule = extract_rules(Weights_andre=Weights_andre, X_train=X_train, 
+    final_rule = extract_rules(andre_probs=andre_probs, X_train=X_train, 
                                dataset_type=dataset_type, body_predicates=body_predicates,
                                head_predicate=head_predicate)
     print("\n======================================")
@@ -975,12 +1002,12 @@ def main():
 
         rule_evaluations = []
 
-        for rule_idx, rule_weights in enumerate(Weights_andre):
+        for rule_idx, rule_probs in enumerate(andre_probs):
             print(f"\nEvaluating Rule {rule_idx + 1}...")
             
             # Evaluate this rule
             metrics = evaluate_single_rule(
-                rule_weights, 
+                rule_probs, 
                 X_train, 
                 y_train, 
                 variable_matrix if structured_data else None,
@@ -989,11 +1016,11 @@ def main():
             
             # Extract the rule text
             if dataset_type == "binary":
-                preds = interpret_neuron_weights(body_preds=body_predicates, Weights=rule_weights)
+                preds = interpret_neuron_weights(body_preds=body_predicates, andre_probs=rule_probs)
             else:
                 # For probabilistic, use a representative sample
                 sample_pred_values = X_train[0].cpu().numpy()
-                preds = interpret_neuron_weights_entropy(sample_pred_values, rule_weights)
+                preds = interpret_neuron_weights_entropy(sample_pred_values, rule_probs)
             
             refined_preds = [pred for pred in preds if pred != '1' and pred != '?']
             rule_text = " and ".join(refined_preds) if refined_preds else "true"
@@ -1007,7 +1034,7 @@ def main():
                 'recall': metrics['recall'],
                 'f1_score': metrics['f1_score'],
                 'roc_auc': metrics['roc_auc'],
-                'weights': rule_weights
+                'andre_probs': rule_probs
             })
             
             print(f"Rule {rule_idx + 1}: {rule_text}")
@@ -1085,7 +1112,7 @@ def main():
         os.makedirs(save_dir_rules, exist_ok=True)
         
         # Prepare rule weights for export (nested list format)
-        sorted_rule_weights = [rule_info['weights'] for rule_info in rules_to_use]
+        sorted_rule_weights = [rule_info['raw_weights'] for rule_info in rules_to_use]
         
         # Build a unified model from sorted rules
         unified_model = ANDRE.build_from_rule_weights(
