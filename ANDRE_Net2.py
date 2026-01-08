@@ -23,14 +23,14 @@ class ProbSumActivation(nn.Module):
     def forward(self, X_basis):
         """
         X_basis: [B, D, 3]
-        raw_weights: [D, 3]
-        returns activated: [B, D]
+        raw_weights: [D, 3] - stored in logit space (before softmax)
+        returns: activated: [B, D], andre_probs: [D, 3] - softmaxed probabilities
         """
-        # weights per predicate
-        weights = torch.softmax(self.raw_weights, dim=1)              # [D, 3]
+        # Convert raw_weights (logits) to probabilities via softmax
+        andre_probs = torch.softmax(self.raw_weights, dim=1)              # [D, 3]
 
         # Expand so batch size dimension aligns
-        W = weights.unsqueeze(0)                                       # [1, D, 3]
+        W = andre_probs.unsqueeze(0)                                       # [1, D, 3]
 
         # Weighted inputs
         Xw = W * X_basis                                               # [B, D, 3]
@@ -44,7 +44,7 @@ class ProbSumActivation(nn.Module):
         triple = (Xw[:, :, 0] * Xw[:, :, 1] * Xw[:, :, 2])             # [B, D]
 
         activated = S1 - pair + triple                                 # [B, D]
-        return activated, weights
+        return activated, andre_probs
 
 
 class RuleBlock(nn.Module):
@@ -56,16 +56,16 @@ class RuleBlock(nn.Module):
         """
         X_basis: [B, D, 3]
         V: variable matrix [D, K] or None
-        returns: rule_output [B], weights [D,3], entropy, P [D], M [K] or None
+        returns: rule_output [B], andre_probs [D,3], entropy, P [D], M [K] or None
         """
         # Apply ProbSum over all predicates at once
-        conj, weights = self.activation(X_basis)      # conj: [B, D]
+        conj, andre_probs = self.activation(X_basis)      # conj: [B, D], andre_probs: [D, 3]
 
         # Compute entropy for this rule
-        entropy = -(weights * (weights + 1e-6).log()).sum()
+        entropy = -(andre_probs * (andre_probs + 1e-6).log()).sum()
 
-        # P_j = 1 - w3
-        P = 1.0 - weights[:, 2]                       # [D]
+        # P_j = 1 - w3 (probability that predicate is NOT constant)
+        P = 1.0 - andre_probs[:, 2]                       # [D]
 
         # Compute M with proper gradient tracking
         if V is not None:
@@ -78,7 +78,7 @@ class RuleBlock(nn.Module):
         out = (attn * conj).sum(dim=1)                # [B]
         rule_output = torch.sigmoid(lambda_ * (out - GAMMA1))
 
-        return rule_output, weights, entropy, P, M
+        return rule_output, andre_probs, entropy, P, M
 
 
 class ANDRE(nn.Module):
@@ -109,7 +109,7 @@ class ANDRE(nn.Module):
     def forward(self, x):
         """
         x: [B, D]
-        returns: activated_output: [B]
+        returns: activated_output: [B], all_andre_probs: list of softmaxed probabilities
         """
         B, D = x.shape
 
@@ -120,15 +120,15 @@ class ANDRE(nn.Module):
         X_basis = torch.stack([X1, X2, X3], dim=2)  # [B, D, 3]
 
         rule_vals = []
-        all_weights = []
+        all_andre_probs = []
         all_entropies = []
         all_M = []
 
         # Evaluate each rule as a batch
         for r in self.rules:
-            r_out, weights, entropy, P, M = r(X_basis, self.beta, self.lambda_, GAMMA1, self.V)
+            r_out, andre_probs, entropy, P, M = r(X_basis, self.beta, self.lambda_, GAMMA1, self.V)
             rule_vals.append(r_out)                      # r_out: [B]
-            all_weights.append(weights.view(-1))         # flatten weights
+            all_andre_probs.append(andre_probs.view(-1))     # flatten softmaxed probabilities
             all_entropies.append(entropy)
             all_M.append(M)
 
@@ -140,7 +140,7 @@ class ANDRE(nn.Module):
         out = (attn * rule_vals).sum(dim=1)                 # [B]
         activated_output = torch.sigmoid(self.lambda_ * (out - GAMMA2))  # [B]
 
-        return activated_output, all_weights, all_entropies, all_M
+        return activated_output, all_andre_probs, all_entropies, all_M
 
     
     def evaluate(self, x, y, threshold=0.5):
@@ -459,7 +459,7 @@ class ANDRE(nn.Module):
 
         rule_vals = []
         for r_idx, rule_block in enumerate(self.rules):
-            r_out, weights, entropy, P, M = rule_block(X_basis, self.beta, self.lambda_, GAMMA1, self.V)
+            r_out, andre_probs, entropy, P, M = rule_block(X_basis, self.beta, self.lambda_, GAMMA1, self.V)
             # r_out: [B]
             rule_vals.append(r_out)
 

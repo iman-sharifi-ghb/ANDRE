@@ -109,21 +109,21 @@ def parse_rule_and_generate_data(rule_str, num_samples=1000, sample_type="binary
     return X_train, y_train, body_predicates, head_predicate
 
 
-def interpret_neuron_weights_entropy_(body_preds, pred_values, Weights, entropy_threshold=0.8):
+def interpret_neuron_weights_entropy_(body_preds, pred_values, andre_probs, entropy_threshold=0.8):
     """
-    Interpret the weights of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1'.
+    Interpret the softmaxed probabilities of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1'.
 
     Args:
         body_preds (list): A list of predicate strings for each neuron, like ['b1', 'b2', ...] or ['b1(X1, X2)', 'b2(X3)', ...]
         pred_value: The predicted value to be used in interpretation. it is a scalar value between 0 and 1.
-        weights (numpy.ndarray): A 2D numpy array where each row corresponds to the weights of a neuron.
+        andre_probs (numpy.ndarray): A 2D numpy array where each row corresponds to the softmaxed probabilities of a neuron.
 
     Returns:
         list: A list of strings ('b_{i}', 'not(b_{i})', or '1') for each neuron.
     """
     
     interpretations = []
-    for i, weights in enumerate(Weights):
+    for i, weights in enumerate(andre_probs):
         weights_tensor = torch.tensor(weights, dtype=torch.float32)
         entropy = -torch.sum(weights_tensor * torch.log(weights_tensor + 1e-10)).item()
         # print(f"Neuron {i+1} weights: {weights}, Entropy: {entropy}")
@@ -151,21 +151,21 @@ def interpret_neuron_weights_entropy_(body_preds, pred_values, Weights, entropy_
 
     return interpretations
 
-def interpret_neuron_weights_entropy(pred_values, Weights, entropy_threshold=0.8):
+def interpret_neuron_weights_entropy(pred_values, andre_probs, entropy_threshold=0.8):
     """
-    Interpret the weights of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1',
+    Interpret the softmaxed probabilities of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1',
     only if entropy is below a threshold to ensure confidence in prediction.
 
     Args:
         pred_values (numpy.ndarray): A 1D array with predicate values (between 0 and 1).
-        Weights (list of list): A 2D list where each row is the softmaxed weights of a neuron.
+        andre_probs (list of list): A 2D list where each row is the softmaxed probabilities of a neuron.
         entropy_threshold (float): The threshold of entropy above which output is considered uncertain.
 
     Returns:
         list: A list of strings ('b_{i}', 'not(b_{i})', or '1') for each neuron, or '?' for uncertain.
     """
     interpretations = []
-    for i, weights in enumerate(Weights):
+    for i, weights in enumerate(andre_probs):
         weights_tensor = torch.tensor(weights, dtype=torch.float32)
         entropy = -torch.sum(weights_tensor * torch.log(weights_tensor + 1e-10)).item()
         # print(f"Neuron {i+1} weights: {weights}, Entropy: {entropy}")
@@ -187,13 +187,13 @@ def interpret_neuron_weights_entropy(pred_values, Weights, entropy_threshold=0.8
 
     return interpretations
 
-def interpret_neuron_weights_(pred_values, Weights):
+def interpret_neuron_weights_(pred_values, andre_probs):
     """
-    Interpret the weights of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1'.
+    Interpret the softmaxed probabilities of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1'.
 
     Args:
         pred_value: The predicted value to be used in interpretation. it is a scalar value between 0 and 1.
-        weights (numpy.ndarray): A 2D numpy array where each row corresponds to the weights of a neuron.
+        andre_probs (numpy.ndarray): A 2D numpy array where each row corresponds to the softmaxed probabilities of a neuron.
 
     Returns:
         list: A list of strings ('b_{i}', 'not(b_{i})', or '1') for each neuron.
@@ -201,7 +201,7 @@ def interpret_neuron_weights_(pred_values, Weights):
     
 
     interpretations = []
-    for i, weights in enumerate(Weights):
+    for i, weights in enumerate(andre_probs):
 
         # Find predicate value of a given neuron
         pred_value = pred_values[i]
@@ -221,12 +221,12 @@ def interpret_neuron_weights_(pred_values, Weights):
 
     return interpretations
 
-def interpret_neuron_weights(body_preds=None, Weights=None):
+def interpret_neuron_weights(body_preds=None, andre_probs=None):
     """
-    Interpret the weights of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1'.
+    Interpret the softmaxed probabilities of neurons and return a list of 'b_{i}', 'not(b_{i})', or '1'.
 
     Args:
-        weights (numpy.ndarray): A 2D numpy array where each row corresponds to the weights of a neuron.
+        andre_probs (numpy.ndarray): A 2D numpy array where each row corresponds to the softmaxed probabilities of a neuron.
 
     Returns:
         list: A list of strings ('b_{i}', 'not(b_{i})', or '1') for each neuron.
@@ -234,7 +234,7 @@ def interpret_neuron_weights(body_preds=None, Weights=None):
     
     if body_preds is None:
         interpretations = []
-        for i, weights in enumerate(Weights):
+        for i, weights in enumerate(andre_probs):
 
             # compute {weights[0], weights[1], weights[2]}
             new_weights = [weights[0], weights[1], weights[2]]
@@ -252,7 +252,7 @@ def interpret_neuron_weights(body_preds=None, Weights=None):
     
     else:
         interpretations = []
-        for i, weights in enumerate(Weights):
+        for i, weights in enumerate(andre_probs):
 
             body_pred = body_preds[i]
             # compute {weights[0], weights[1], weights[2]}
@@ -382,13 +382,13 @@ def check_binary_dataset(x_train):
             return False
     return True
 
-def plot_andre_weights(Weights_andre, input_dim, predicates=None, structured_data=False):    
+def plot_andre_weights(andre_probs, input_dim, predicates=None, structured_data=False):    
 
     # Grid of subplots: one subplot per (rule, body-predicate/neuron).
-    # Each subplot shows the 3 weight components for that neuron as a small bar-chart.
+    # Each subplot shows the 3 probability components for that neuron as a small bar-chart.
     # (A true histogram isn't meaningful for just 3 values, so we use bars.)
     body_predicates = predicates if structured_data else [f"b{i+1}" for i in range(input_dim)]
-    w_arr = np.array(Weights_andre, dtype=float)
+    w_arr = np.array(andre_probs, dtype=float)
     if w_arr.ndim != 3 or w_arr.shape[2] != 3:
         raise ValueError(f"Expected Weights_nsre shape (R, N, 3), got {w_arr.shape}")
 
@@ -443,12 +443,12 @@ def plot_andre_weights(Weights_andre, input_dim, predicates=None, structured_dat
     fig.suptitle(suptitle, fontsize=10)
     plt.show()
 
-def extract_rules(Weights_andre, X_train, dataset_type, body_predicates, head_predicate):
+def extract_rules(andre_probs, X_train, dataset_type, body_predicates, head_predicate):
     # Rule interpretation
     Predicate_values = X_train
     if dataset_type == "probabilistic":
         Final_rules = []
-        for rule_num, weights in enumerate(Weights_andre):
+        for rule_num, weights in enumerate(andre_probs):
             Extracted_rules = []
             for i in range(len(Predicate_values)):
                 pred_values = Predicate_values[i].numpy()
@@ -465,8 +465,8 @@ def extract_rules(Weights_andre, X_train, dataset_type, body_predicates, head_pr
             Final_rules.append(most_common_rule)
     else:
         Final_rules = []
-        for rule_num, weights in enumerate(Weights_andre):
-            preds = interpret_neuron_weights(body_preds=body_predicates, Weights=weights)
+        for rule_num, weights in enumerate(andre_probs):
+            preds = interpret_neuron_weights(body_preds=body_predicates, andre_probs=weights)
             refined_preds = [pred for pred in preds if pred != '1']
             rule = f"{head_predicate} :- " + " and ".join(refined_preds) + "."
             print(f"Extracted Rule: {rule}")
@@ -969,12 +969,12 @@ def get_predicate_name(index, predicate_list, relation_variable_permutations, al
     
     return "Unknown"
 
-def evaluate_single_rule(rule_weights, X_data, y_data, variable_matrix, device):
+def evaluate_single_rule(raw_weights, X_data, y_data, variable_matrix, device):
     """
     Create a single-rule ANDRE model and evaluate its accuracy.
     
     Args:
-        rule_weights: List of weights for all neurons in the rule
+        raw_weights: List of raw weights (logit space) for all neurons in the rule
         X_data: Input features
         y_data: True labels
         variable_matrix: Variable matrix for structured data
@@ -991,14 +991,14 @@ def evaluate_single_rule(rule_weights, X_data, y_data, variable_matrix, device):
                               variable_matrix=variable_matrix, lr=0.005, weight_decay=1e-4)
     single_rule_model = single_rule_model.to(device)
     
-    # Load the weights for this single rule
+    # Load the raw weights for this single rule
     # In ANDRE_Net2, the structure is: rules[0] is a RuleBlock, which contains activation (ProbSumActivation)
-    # The raw_weights are in the activation layer
+    # The raw_weights are in the activation layer (before softmax)
     with torch.no_grad():
-        # Stack all neuron weights into a single tensor [input_dim, 3]
-        weights_array = torch.tensor(rule_weights, dtype=torch.float32, device=device)  # [input_dim, 3]
-        # Use log to approximate inverse softmax
-        single_rule_model.rules[0].activation.raw_weights.data = torch.log(weights_array + 1e-10)
+        # Stack all neuron raw weights into a single tensor [input_dim, 3]
+        raw_weights_array = torch.tensor(raw_weights, dtype=torch.float32, device=device)  # [input_dim, 3]
+        # Directly assign raw weights (raw_weights are already in raw/logit space before softmax)
+        single_rule_model.rules[0].activation.raw_weights.data = raw_weights_array
     
     # Evaluate the single rule
     single_rule_model.eval()
