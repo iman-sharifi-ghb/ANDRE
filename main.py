@@ -997,7 +997,7 @@ def main():
         body_predicate_probs = rule_probs.reshape(-1, 3)
         andre_probs.append(body_predicate_probs.tolist())
 
-    if visualize_weights:
+    if visualize_weights and input_dim <= 10:
         plot_andre_weights(andre_probs, input_dim=input_dim, predicates=body_predicates, structured_data=structured_data)
 
     # Rule interpretation

@@ -393,12 +393,9 @@ def plot_andre_weights(andre_probs, input_dim, predicates=None, structured_data=
         raise ValueError(f"Expected Weights_nsre shape (R, N, 3), got {w_arr.shape}")
 
     R, N, C = w_arr.shape
-    # prefer notebook variables if present
-    R_use = Num_rules if 'Num_rules' in globals() else R
-    N_use = input_dim if 'input_dim' in globals() else N
-    if (R_use, N_use) != (R, N):
-        # fall back to array shape but warn via title
-        R_use, N_use = R, N
+    # Use the actual dimensions from the array
+    R_use = R
+    N_use = N
 
     fig, axes = plt.subplots(R_use, N_use, figsize=(N_use * 1.6, R_use * 1.6), constrained_layout=True)
     # Ensure axes is 2D
