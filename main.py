@@ -11,6 +11,7 @@ import pickle
 import os
 import sys
 import json
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -505,8 +506,13 @@ def main():
     
     # Store all discovered rules with their accuracies
     all_discovered_rules = []
+    
+    # Dictionary to store training times for each num_rules
+    training_times = {}
 
     for num_rules in rule_counts_to_train:
+        # Start timing for this num_rules
+        start_time = time.time()
         for restart in range(num_restarts):
             print(f"\n=== Training ANDRE with {num_rules} rules, Restart {restart + 1}/{num_restarts} ===")
             model = ANDRE(num_rules, pot_body_pred_dim=input_dim, 
@@ -814,6 +820,20 @@ def main():
                 if train_metric > acc_threshold and eval_metric > acc_threshold:
                     print(f"The accuracy threshold of {acc_threshold} has been reached. Stopping further restarts.")
                     break
+        
+        # End timing for this num_rules
+        end_time = time.time()
+        training_times[num_rules] = end_time - start_time
+        print(f"\n*** Training time for {num_rules} rules: {training_times[num_rules]:.2f} seconds ({training_times[num_rules]/60:.2f} minutes) ***\n")
+
+    # Print summary of all training times
+    print("\n" + "="*70)
+    print("TRAINING TIME SUMMARY")
+    print("="*70)
+    for num_rules in sorted(training_times.keys()):
+        elapsed = training_times[num_rules]
+        print(f"  {num_rules} rules: {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
+    print("="*70 + "\n")
 
     # Load the best model
     best_model = ANDRE(best_num_rules, pot_body_pred_dim=input_dim, 
