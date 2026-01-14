@@ -439,11 +439,11 @@ def main():
             print(f"New input_dim: {input_dim}\n")
 
     # Remove half of the data samples in X_train and y_train for faster experimentation
-    # if args.num_samples < num_samples:
-    #     num_samples = args.num_samples
-    #     X_train = X_train[:num_samples].clone()
-    #     y_train = y_train[:num_samples].clone()
-    #     print(f"Reduced dataset size to {num_samples} samples for faster experimentation.")
+    if args.num_samples < num_samples and num_samples > 1000000:
+        num_samples = args.num_samples
+        X_train = X_train[:num_samples].clone()
+        y_train = y_train[:num_samples].clone()
+        print(f"Reduced dataset size to {num_samples} samples for faster experimentation.")
 
     # Create a validation split
     n = X_train.size(0)

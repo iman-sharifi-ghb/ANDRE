@@ -1,4 +1,4 @@
-# ANDRE: Adaptive Neural-symbolic Differentiable Rule Engine
+# ANDRE: Attention-based Neural-symbolic Differentiable Rule Extractor
 
 An advanced neural-symbolic learning framework for extracting interpretable logical rules from relational data using differentiable neural networks with attention mechanisms.
 
